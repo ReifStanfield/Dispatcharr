@@ -1331,7 +1331,13 @@ def hls_playlist(request, channel_id, client_id):
         # window_sustains_playback). Warm channels satisfy this on the first
         # read and never enter the loop.
         playlist_key = RedisKeys.output_playlist(channel_id, fmt)
-        deadline = time.time() + 10
+        # Long enough that the depth the gate wants is actually reachable. A
+        # cold channel accumulates media at 1x once its pre-roll backlog is
+        # segmented, so a 10s requirement needs more than a 10s deadline or
+        # the hold always expires and serves the thin window it was meant to
+        # avoid. Past this the short playlist goes out anyway - a player with
+        # something to chew on beats a player with an error.
+        deadline = time.time() + 20
         playlist_state = None
         while True:
             playlist_json = redis_client.get(playlist_key)
@@ -1347,9 +1353,7 @@ def hls_playlist(request, channel_id, client_id):
                 # deadline expires, a short playlist beats no playlist.
                 playlist_state = parsed
                 if window_sustains_playback(
-                    parsed.get("window") or [],
-                    parsed.get("target", 4),
-                    adv_target=parsed.get("adv_target"),
+                    parsed.get("window") or [], parsed.get("target", 4)
                 ):
                     break
 

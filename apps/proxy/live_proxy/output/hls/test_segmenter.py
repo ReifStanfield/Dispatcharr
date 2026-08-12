@@ -16,6 +16,7 @@ from .segmenter import (
     parse_pmt,
     render_media_playlist,
     window_sustains_playback,
+    LIVE_EDGE_OFFSET_FACTOR,
     starts_keyframe,
 )
 
@@ -218,6 +219,79 @@ class SegmenterTests(unittest.TestCase):
         for s in finished:
             self.assertAlmostEqual(s.duration, 4.0, places=3)
 
+    def test_gop_dividing_the_target_still_cuts_at_the_target(self):
+        # The common case must not regress: a 2s GOP against a 4s target keeps
+        # cutting 4s segments. The threshold is target-minus-a-GOP plus an
+        # epsilon (2.01 here), so the 2s keyframe is skipped and the 4s one
+        # cuts - without the epsilon this would halve every segment.
+        seg = self.make_started(target=4.0)
+        finished = feed_stream(seg, gop_seconds=2.0, gop_count=13)
+        durs = [round(s.duration, 3) for s in finished]
+        self.assertTrue(all(abs(d - 4.0) < 0.01 for d in durs), durs)
+
+    def test_gop_not_dividing_the_target_lands_under_it(self):
+        # A 3s GOP used to cut at the first keyframe PAST the target - a 6s
+        # segment, which is what forced TARGETDURATION up to 6 and made the
+        # client reload slower than segments were produced. Aiming at the
+        # largest whole number of GOPs that fits gives 3s segments instead:
+        # keyframe-aligned, and under the target so it can be advertised as 4.
+        seg = self.make_started(target=4.0)
+        finished = feed_stream(seg, gop_seconds=3.0, gop_count=13)
+        durs = [round(s.duration, 3) for s in finished[1:]]   # skip GOP learn-in
+        self.assertTrue(durs, "expected segments")
+        self.assertTrue(all(abs(d - 3.0) < 0.01 for d in durs), durs)
+        self.assertTrue(all(d <= 4.0 for d in durs), durs)
+
+    def test_every_extinf_rounds_to_the_advertised_target(self):
+        # The invariant the whole TARGETDURATION change rests on (RFC 8216
+        # 4.3.3.1: each EXTINF rounded to nearest int must be <= the target).
+        #
+        # Fed at a realistic 25fps, because the ceiling can only be enforced on
+        # a picture boundary: the cut lands on the first frame at or past it,
+        # so the emitted EXTINF overshoots by up to one frame interval. A live
+        # source emitted 4.538s against a target of 4 - rounding to 5 - when
+        # the ceiling sat at 4.49 and left a window narrower than one frame.
+        for gop in (0.5, 1.0, 2.0, 3.0, 4.0, 4.6, 6.0):
+            seg = self.make_started(target=4.0)
+            seg.max_segment_duration = 4.0 + 0.35
+            finished = []
+            pts = 10.0
+            # Enough GOPs to span several segments whatever the GOP length.
+            for _ in range(max(8, int(30 / gop))):
+                finished += seg.feed(make_video_pes(pts, keyframe=True))
+                step = 0.04
+                while step < gop:
+                    finished += seg.feed(make_video_pes(pts + step, keyframe=False))
+                    step += 0.04
+                pts += gop
+            self.assertTrue(finished, f"gop={gop} produced nothing")
+            for s in finished:
+                self.assertLessEqual(round(s.duration), 4,
+                                     f"gop={gop} dur={s.duration}")
+
+    def test_gop_longer_than_target_is_force_cut_at_the_ceiling(self):
+        # A source whose GOP exceeds the target cannot give both keyframe
+        # alignment and a segment under the target. The ceiling wins, so the
+        # advertised value stays truthful; the cost is a mid-GOP cut.
+        #
+        # Fed by hand rather than through feed_stream: the force cut can only
+        # fire on a picture whose PTS lands in [ceiling, next keyframe), and
+        # feed_stream's fillers only run 1s into each GOP.
+        seg = self.make_started(target=4.0)
+        seg.max_segment_duration = 4.49
+        finished = []
+        pts = 10.0
+        for _ in range(5):
+            finished += seg.feed(make_video_pes(pts, keyframe=True))
+            step = 0.5
+            while step < 6.0:
+                finished += seg.feed(make_video_pes(pts + step, keyframe=False))
+                step += 0.5
+            pts += 6.0
+        self.assertTrue(finished)
+        for s in finished:
+            self.assertLessEqual(round(s.duration), 4, s.duration)
+
     def test_segments_start_with_pat_pmt(self):
         seg = self.make_started()
         finished = feed_stream(seg, gop_seconds=4.0, gop_count=3)
@@ -387,38 +461,52 @@ class StartWindowTests(unittest.TestCase):
         # served the instant it existed.
         self.assertFalse(window_sustains_playback([{"seq": 0, "dur": 1.5}], 4))
 
-    def test_three_short_starters_under_one_target_is_not_enough(self):
+    def test_three_short_starters_are_not_enough(self):
         # Three segments but only 3s of media: the player begins effectively at
         # the live edge and starves on the next cut.
         w = [{"seq": i, "dur": 1.0} for i in range(3)]
         self.assertFalse(window_sustains_playback(w, 4))
 
-    def test_starter_ladder_of_three_gops_is_enough(self):
-        # The ladder's own output: three 2s GOP segments, 6s >= the 6s ceiling.
+    def test_starter_ladder_of_three_gops_is_not_enough(self):
+        # Three 2s GOP starters is 6s - enough to start playing, not enough to
+        # absorb the player's own fetch latency, which is what the 10s join
+        # offset exists to cover.
         w = [{"seq": i, "dur": 2.0} for i in range(3)]
-        self.assertTrue(window_sustains_playback(w, 4, adv_target=6))
+        self.assertFalse(window_sustains_playback(w, 4))
 
-    def test_gate_measures_against_the_ceiling_not_the_target(self):
-        # The window observed live when the stall survived: 4 starters, 4.3s.
-        # It cleared a 4s target but the next segment took 5.1s to arrive, so
-        # the player was left about a second short. Against the 6s ceiling it
-        # correctly waits for more.
-        w = [{"seq": 1, "dur": 0.968}, {"seq": 2, "dur": 1.034},
-             {"seq": 3, "dur": 2.002}, {"seq": 4, "dur": 0.300}]
-        self.assertTrue(window_sustains_playback(w, 4))            # target only
-        self.assertFalse(window_sustains_playback(w, 4, adv_target=6))
+    def test_gate_requires_the_advertised_join_offset(self):
+        # The window AVPlayer stalled on: 6.4s, against an EXT-X-START that
+        # tells the player to join 10s behind the live edge. The playlist was
+        # promising a join point the window could not reach, so the player
+        # started at the head with less runway than it was told to expect and
+        # ran dry eighteen seconds in.
+        w = [{"seq": 1, "dur": 2.619}, {"seq": 2, "dur": 2.002},
+             {"seq": 3, "dur": 1.802}]
+        self.assertLess(sum(e["dur"] for e in w), LIVE_EDGE_OFFSET_FACTOR * 4)
+        self.assertFalse(window_sustains_playback(w, 4))
+
+    def test_gate_and_playlist_agree_on_the_join_point(self):
+        # The gate's threshold and EXT-X-START's offset are the same constant
+        # by construction: a window that just clears the gate is exactly deep
+        # enough to honor the offset the playlist advertises.
+        target = 4
+        w = [{"seq": i + 1, "dur": 2.5} for i in range(4)]   # 10.0s
+        self.assertTrue(window_sustains_playback(w, target))
+        text = render_media_playlist(w, target, adv_target=4)
+        offset = LIVE_EDGE_OFFSET_FACTOR * target
+        self.assertIn(f"#EXT-X-START:TIME-OFFSET=-{offset:.3f},PRECISE=YES", text)
 
     def test_first_session_window_starts_at_seq_one(self):
         # The chunk index backing the media sequence starts at 1, not 0, so
         # nothing here may treat a nonzero first seq as proof the window has
         # rolled - that read served a cold 1-segment playlist unguarded.
-        self.assertFalse(window_sustains_playback([{"seq": 1, "dur": 2.0}], 4, adv_target=6))
+        self.assertFalse(window_sustains_playback([{"seq": 1, "dur": 2.0}], 4))
 
     def test_two_long_segments_still_wait_for_a_third(self):
         # Duration alone is not sufficient; players want a few segments listed.
-        self.assertTrue(sum([5.0, 5.0]) >= 4)
+        self.assertGreaterEqual(5.0 + 6.0, LIVE_EDGE_OFFSET_FACTOR * 4)
         self.assertFalse(
-            window_sustains_playback([{"seq": 0, "dur": 5.0}, {"seq": 1, "dur": 5.0}], 4)
+            window_sustains_playback([{"seq": 0, "dur": 5.0}, {"seq": 1, "dur": 6.0}], 4)
         )
 
     def test_rolled_window_is_never_gated(self):
@@ -430,7 +518,7 @@ class StartWindowTests(unittest.TestCase):
         # window too short to clear the gate is by definition one that has not
         # filled yet.
         rolled = [{"seq": 40 + i, "dur": 4.0} for i in range(10)]
-        self.assertTrue(window_sustains_playback(rolled, 4, adv_target=6))
+        self.assertTrue(window_sustains_playback(rolled, 4))
 
     def test_warm_window_passes_immediately(self):
         w = [{"seq": i, "dur": 4.0} for i in range(10)]
@@ -445,7 +533,11 @@ class StartWindowTests(unittest.TestCase):
         self.assertFalse(window_sustains_playback(w, 4))
 
     def test_non_numeric_target_falls_back(self):
-        w = [{"seq": i, "dur": 2.0} for i in range(3)]
+        # Falls back to the 4s default target, so the requirement is the same
+        # 10s it would be with an explicit 4.
+        w = [{"seq": i, "dur": 2.0} for i in range(3)]     # 6.0s
+        self.assertFalse(window_sustains_playback(w, None))
+        w = [{"seq": i, "dur": 4.0} for i in range(3)]     # 12.0s
         self.assertTrue(window_sustains_playback(w, None))
 
 

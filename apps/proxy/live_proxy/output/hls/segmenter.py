@@ -249,6 +249,14 @@ class TSSegmenter:
         self._collecting = False
         self._pending_discontinuity = False
         self._current_discontinuity = False
+        # Running estimate of the source's keyframe interval, measured from
+        # the gap between consecutive keyframes. Needed because the cut rule
+        # aims at the largest whole number of GOPs that still fits INSIDE the
+        # target (see _cut_threshold); until a second keyframe has been seen
+        # there is nothing to estimate from and the rule falls back to cutting
+        # at the first keyframe past the target.
+        self._gop_estimate = None
+        self._last_keyframe_pts = None
 
     @property
     def video_detected(self):
@@ -340,6 +348,8 @@ class TSSegmenter:
             keyframe = starts_keyframe(packet, self._video_stream_type)
             if pts is not None:
                 self._seg_last_pts = pts
+            if keyframe and pts is not None:
+                self._note_keyframe(pts)
 
             if not self._collecting:
                 if keyframe:
@@ -377,14 +387,57 @@ class TSSegmenter:
     def _cut_threshold(self):
         """Elapsed time at which the next keyframe may close the segment.
 
-        Zero while starter cuts remain (any keyframe cuts), then each ramp
-        step in turn, then the steady-state target.
+        The starter floor while starter cuts remain, then each ramp step in
+        turn, then steady state.
+
+        Steady state aims at the largest whole number of GOPs that fits at or
+        under the target, rather than the first keyframe at or AFTER it. The
+        difference decides what TARGETDURATION can be, and TARGETDURATION is
+        the client's playlist reload interval (RFC 8216 6.3.4): advertise more
+        than a segment's worth and the player reloads more slowly than
+        segments are produced, losing buffer lead every cycle until it stalls.
+        Measured with AVPlayer against a 4s target advertised as 6: the lead
+        eroded from 7s to 1s in twelve seconds and the player ran dry with
+        four seconds of media sitting unfetched on the server.
+
+        Overshooting is what forced that headroom. A 3s GOP against a 4s
+        target used to cut at the first keyframe past 4s - a 6s segment,
+        needing TARGETDURATION 6. Subtracting one GOP from the target cuts at
+        3s instead, so the segment lands under the target and the advertised
+        value can equal it. Sources whose GOP is longer than the target cannot
+        satisfy both constraints and are handled by the force-cut ceiling.
         """
         if self._startup_cuts_remaining > 0:
             return self.startup_min_duration
         if self._startup_ramp:
             return max(self._startup_ramp[0], self.startup_min_duration)
-        return self.target_duration
+        if not self._gop_estimate:
+            return self.target_duration
+        # The epsilon keeps a keyframe landing exactly one GOP short of the
+        # target from cutting there: with a 2s GOP and a 4s target the
+        # threshold is 2.01, so the 2s keyframe is skipped and the 4s one
+        # cuts - a full target-length segment, not a half-length one.
+        return max(self.target_duration - self._gop_estimate + 0.01, 0.01)
+
+    def _note_keyframe(self, pts):
+        """Fold one keyframe interval into the running GOP estimate.
+
+        Deliberately conservative: it tracks the LARGEST recent interval
+        rather than the mean. The estimate is subtracted from the target, so
+        underestimating it makes segments overshoot the target - the very
+        thing that forced the oversized TARGETDURATION. A spurious keyframe
+        reports a short interval, which must not drag the estimate down.
+        """
+        if self._last_keyframe_pts is not None:
+            gap = self._elapsed(pts, self._last_keyframe_pts)
+            # Ignore nonsense: duplicates, and jumps past a plausible GOP.
+            if 0 < gap <= 4 * self.target_duration:
+                if self._gop_estimate is None:
+                    self._gop_estimate = gap
+                else:
+                    # Rise immediately, decay slowly.
+                    self._gop_estimate = max(gap, self._gop_estimate * 0.9)
+        self._last_keyframe_pts = pts
 
     def _elapsed(self, pts, start):
         """Wrap-safe presentation-time delta in seconds."""
@@ -445,19 +498,27 @@ class TSSegmenter:
 # mid-session reload never waits.
 MIN_START_SEGMENTS = 3
 
+# Where a joining player is told to start, as a multiple of the cut target,
+# and therefore also how much media the window must hold before it is served.
+# One constant for both: EXT-X-START promising a join point 10s behind the
+# live edge while the window holds 6s is a promise the playlist cannot keep,
+# and the player silently starts at the window head with correspondingly less
+# runway than it was told to expect.
+LIVE_EDGE_OFFSET_FACTOR = 2.5
 
-def window_sustains_playback(window, target_duration, adv_target=None,
+
+def window_sustains_playback(window, target_duration,
                              min_segments=MIN_START_SEGMENTS):
     """True when a window is deep enough to hand to a player.
 
     Requires a segment count (players want a few segments listed before they
-    will start) AND enough media to cover the worst-case wait for the next
-    segment. That worst case is the force-cut ceiling - the frozen
-    TARGETDURATION - not the nominal cut target: a segment may legitimately
-    take until the ceiling to close, and measured on a live source the first
-    post-ladder segment took 5.1s of wall clock against a 4s target. Gating
-    on the target alone let a 4.3s window through and left the player about
-    a second short.
+    will start) AND as much media as EXT-X-START tells the player to sit
+    behind the live edge. Anything less and the playlist contradicts itself:
+    the tag asks for a join point the window cannot reach, so the player
+    starts at the window head with less runway than it was promised and is
+    left absorbing its own fetch latency out of a buffer that was never
+    deep enough. Measured with AVPlayer against a 6.4s window: it joined,
+    lost lead steadily, and stalled eighteen seconds in.
 
     Only ever gates a COLD start. The window is trimmed to a fixed size and
     never shrinks once full, so a window too short to pass here is by
@@ -468,9 +529,9 @@ def window_sustains_playback(window, target_duration, adv_target=None,
     if not window or len(window) < min_segments:
         return False
     try:
-        needed = float(adv_target) if adv_target else float(target_duration)
+        needed = LIVE_EDGE_OFFSET_FACTOR * float(target_duration)
     except (TypeError, ValueError):
-        needed = 4.0
+        needed = LIVE_EDGE_OFFSET_FACTOR * 4.0
     total = 0.0
     for entry in window:
         try:
@@ -493,7 +554,7 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_
     # Frozen live-edge offset: ~2.5 config target-durations (~10s at the 4s
     # default) so the value is a session constant and never drifts across
     # reloads as the window slides (unlike a window-max derivation).
-    start_offset = 2.5 * target_duration
+    start_offset = LIVE_EDGE_OFFSET_FACTOR * target_duration
     if not window:
         return (
             "#EXTM3U\n"

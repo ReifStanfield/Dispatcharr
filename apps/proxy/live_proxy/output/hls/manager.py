@@ -40,17 +40,26 @@ DEFAULT_SEGMENT_DURATION = 4
 # briefly falls behind (a stall, a slow network hiccup) can still fetch the
 # segment it is on instead of getting a 404 once it has rolled off.
 DEFAULT_WINDOW_SIZE = 10
-# Headroom multiplier for the frozen EXT-X-TARGETDURATION over the cut
-# target. This is not just a ceiling on EXTINF: a client that reloads an
-# UNCHANGED media playlist must wait one-half TARGETDURATION before
-# retrying (RFC 8216 6.3.4), so every point of headroom is also latency a
-# player pays when it asks for the next segment a moment too early. At 2x
-# a 4s target that back-off was 4s - long enough to turn a sub-second wait
-# for the next segment into a visible freeze. 1.5x still clears a normal
-# cut (which lands at the first keyframe at or after the target) by a
-# comfortable GOP, and the segmenter force-cuts anything that would exceed
-# it, so the advertised value stays truthful.
-DEFAULT_TARGET_HEADROOM = 1.5
+# Slack allowed above the advertised EXT-X-TARGETDURATION before a segment
+# is force-cut. RFC 8216 4.3.3.1 requires each EXTINF to be <= the target
+# WHEN ROUNDED TO THE NEAREST INTEGER, so a 4.49s segment is legal against a
+# target of 4 but a 4.5s one is not.
+#
+# Not 0.49, even though that is where rounding actually flips. A cut lands on
+# the first picture at or past the ceiling, so the emitted EXTINF overshoots
+# it by up to one frame interval, and a ceiling of 4.49 emitted a 4.538s
+# segment against a target of 4 - which rounds to 5 and contradicts the
+# frozen value. The margin leaves room for that overshoot on low frame rates.
+#
+# Why this is as tight as it is: TARGETDURATION is not merely a ceiling, it
+# is the client's playlist reload interval (RFC 8216 6.3.4). Advertising
+# more than one segment's worth makes the player reload more slowly than
+# segments are produced, so it loses buffer lead every cycle. Measured with
+# AVPlayer against 4s segments advertised as 6: the lead eroded from 7s to
+# 1s in twelve seconds and playback stalled with four seconds of media
+# sitting unfetched on the server. Advertising the cut target itself keeps
+# reload cadence and production cadence equal.
+TARGET_ROUNDING_SLACK = 0.35
 
 # Demand self-check. HLS clients are pull-based: there is no long-lived
 # response whose teardown reports the disconnect, so the manager itself
@@ -83,16 +92,15 @@ class HLSOutputManager:
         # Advertised EXT-X-TARGETDURATION, computed ONCE and frozen for the life
         # of the playlist (RFC 8216 6.2.1: it MUST NOT change across reloads;
         # AVPlayer latches it at first parse and revalidates every reload).
-        # DEFAULT_TARGET_HEADROOM over the cut target gives a GOP of room past
-        # the cut threshold so a normal segment never exceeds it; the segmenter
-        # force-cuts anything that would, keeping the frozen value truthful
-        # (RFC 8216 4.3.3.1). Kept as tight as that allows because it doubles as
-        # the client's unchanged-playlist reload back-off (see the constant).
-        headroom = ConfigHelper.get('HLS_TARGET_HEADROOM', DEFAULT_TARGET_HEADROOM)
-        self.adv_target = max(
-            int(float(headroom) * self.segment_duration + 0.999),
-            int(self.segment_duration) + 1,
-        )
+        # Equal to the cut target: the segmenter aims each cut at the largest
+        # whole number of GOPs fitting at or under that target, so segments
+        # round to it, and matching the two keeps the client's reload cadence
+        # equal to segment production (see TARGET_ROUNDING_SLACK).
+        self.adv_target = max(int(round(self.segment_duration)), 1)
+        # Force-cut ceiling handed to the segmenter. A segment may only run
+        # past the advertised target by the rounding slack; beyond that it
+        # would round up and contradict the frozen value.
+        self.max_segment_duration = self.adv_target + TARGET_ROUNDING_SLACK
 
         # Same Redis-backed chunk store the fMP4 manager uses; it is
         # format-parameterized by design ("adding a new output format only
@@ -128,7 +136,13 @@ class HLSOutputManager:
                     if prior.get("window"):
                         self._window = prior["window"]
                     if prior.get("adv_target"):
+                        # Inherit the frozen value AND the ceiling derived from
+                        # it, so a takeover cannot start emitting segments that
+                        # round above the target the playlist already advertises.
                         self.adv_target = prior["adv_target"]
+                        self.max_segment_duration = (
+                            self.adv_target + TARGET_ROUNDING_SLACK
+                        )
             except Exception:
                 pass
 
@@ -188,7 +202,7 @@ class HLSOutputManager:
         """Read TS chunks from Redis and feed them through the segmenter."""
         segmenter = TSSegmenter(
             target_duration=self.segment_duration,
-            max_segment_duration=self.adv_target,
+            max_segment_duration=self.max_segment_duration,
         )
 
         # Start behind live so the first segments cover the same window a

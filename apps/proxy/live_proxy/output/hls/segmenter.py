@@ -194,7 +194,7 @@ class TSSegmenter:
     """
 
     def __init__(self, target_duration=4.0, max_segment_duration=None,
-                 startup_keyframe_cuts=4):
+                 startup_keyframe_cuts=4, startup_ramp_fractions=(0.5, 0.75)):
         self.target_duration = float(target_duration)
         # Hard ceiling: force a cut before a segment can exceed this, so no
         # emitted EXTINF ever exceeds the frozen advertised TARGETDURATION even
@@ -205,11 +205,24 @@ class TSSegmenter:
         # cadence, so with a 4s target a player waits ~8-12s for enough
         # media to start. The first N segments therefore cut at EVERY
         # keyframe (one GOP each, typically 1-3s), which gets a playable
-        # playlist up in one GOP and 3 segments within a few seconds; the
-        # cut target then ramps back to normal. Steady-state output is
-        # unchanged, and every starter EXTINF is well under the frozen
-        # TARGETDURATION.
+        # playlist up in one GOP and 3 segments within a few seconds.
         self._startup_cuts_remaining = int(startup_keyframe_cuts)
+        # ...and then the cut target RAMPS back to normal rather than
+        # stepping there in one go. The starter segments are cut from the
+        # backlog the segmenter starts behind live, so they are produced far
+        # faster than 1x; the first full-length segment after them is the
+        # first one produced at live cadence. Jumping straight from a 1-GOP
+        # starter to a full target means the player's next segment can be a
+        # whole target-duration away exactly when its starter buffer runs
+        # dry, which stalls it a few seconds into playback. Intermediate
+        # steps keep the grain fine across that handover, so the wait for
+        # the next segment grows gradually instead of doubling at once.
+        # Steady-state output is unchanged, and every ramp EXTINF stays
+        # under the frozen TARGETDURATION.
+        self._startup_ramp = [
+            float(f) * self.target_duration for f in (startup_ramp_fractions or ())
+            if 0 < float(f) < 1
+        ]
         self._pending = bytearray()
         self._current = bytearray()
         self._pat_packet = None
@@ -330,11 +343,9 @@ class TSSegmenter:
                     self._begin_segment(pts)
                 else:
                     elapsed = self._elapsed(pts, self._segment_start_pts)
-                    # Fast-start ladder: while starter cuts remain, any
-                    # keyframe closes the segment (elapsed > 0 skips
-                    # same-PTS duplicates); afterwards the normal target
-                    # applies.
-                    cut_at = 0.0 if self._startup_cuts_remaining > 0 else self.target_duration
+                    # Fast-start ladder, then ramp; elapsed > 0 skips
+                    # same-PTS duplicates.
+                    cut_at = self._cut_threshold()
                     if elapsed >= cut_at and elapsed > 0:
                         finished = self._finish_segment(elapsed)
                         self._begin_segment(pts)
@@ -352,6 +363,18 @@ class TSSegmenter:
         if self._collecting:
             self._current.extend(packet)
         return finished
+
+    def _cut_threshold(self):
+        """Elapsed time at which the next keyframe may close the segment.
+
+        Zero while starter cuts remain (any keyframe cuts), then each ramp
+        step in turn, then the steady-state target.
+        """
+        if self._startup_cuts_remaining > 0:
+            return 0.0
+        if self._startup_ramp:
+            return self._startup_ramp[0]
+        return self.target_duration
 
     def _elapsed(self, pts, start):
         """Wrap-safe presentation-time delta in seconds."""
@@ -396,7 +419,56 @@ class TSSegmenter:
         self._current_discontinuity = False
         if self._startup_cuts_remaining > 0:
             self._startup_cuts_remaining -= 1
+        elif self._startup_ramp:
+            self._startup_ramp.pop(0)
         return segment
+
+
+# A player starts on whatever the FIRST playlist it reads contains, and on a
+# cold channel that playlist exists as soon as one segment does. Handing it a
+# one- or two-segment window means it begins on a couple of seconds of media
+# cut from the pre-roll backlog, drains that at 1x, and starves at the handover
+# to live-cadence production - a freeze a few seconds in, after which it
+# re-buffers deeper and never stalls again. Holding the first response until
+# the window can sustain playback costs about a second of tune-in and removes
+# the stall. An established channel is already well past this threshold, so a
+# mid-session reload never waits.
+MIN_START_SEGMENTS = 3
+
+
+def window_sustains_playback(window, target_duration, min_segments=MIN_START_SEGMENTS):
+    """True when a window is deep enough to hand to a player.
+
+    Requires both a segment count (players want a few segments before they
+    will start) and at least one full cut target of media, so the player is
+    not already sitting at the live edge the moment playback begins.
+
+    Only ever gates a COLD start. Once the window has rolled (its first media
+    sequence has advanced past zero) the channel has produced a full window's
+    worth of segments, and any thinness is transient - a mid-session reload
+    must be answered immediately, since making a playing client wait is the
+    very stall this gate exists to prevent.
+    """
+    if not window:
+        return False
+    try:
+        if int(window[0].get("seq", 0)) > 0:
+            return True
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if len(window) < min_segments:
+        return False
+    try:
+        target = float(target_duration)
+    except (TypeError, ValueError):
+        target = 4.0
+    total = 0.0
+    for entry in window:
+        try:
+            total += float(entry.get("dur") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return total >= target
 
 
 def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_target=None):
@@ -422,7 +494,6 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_
             f"#EXT-X-TARGETDURATION:{adv_target if adv_target else int(max(target_duration, 1) + 0.999)}\n"
             "#EXT-X-MEDIA-SEQUENCE:0\n"
         )
-    total_duration = sum(entry["dur"] for entry in window)
     # TARGETDURATION: prefer the manager's frozen constant. RFC 8216 6.2.1 forbids
     # it changing across reloads; a per-render ceil(window max) flaps on GOP
     # jitter, and AVPlayer latches the first value and stops advancing on a
@@ -434,12 +505,17 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_
         f"#EXT-X-TARGETDURATION:{advertised_target}",
         f"#EXT-X-MEDIA-SEQUENCE:{window[0]['seq']}",
     ]
-    # Emit EXT-X-START only once the window is deep enough to honor the frozen
-    # offset, so the tag's value is stable across reloads (RFC 8216 6.2.1). It
-    # pins the join point deterministically across players; a client that sets
-    # its own offset still overrides it.
-    if total_duration >= start_offset:
-        lines.append(f"#EXT-X-START:TIME-OFFSET=-{start_offset:.3f},PRECISE=YES")
+    # EXT-X-START is emitted from the FIRST playlist onward. Its value is a
+    # session constant (2.5 config target-durations), so it is stable across
+    # reloads either way (RFC 8216 6.2.1) - but withholding it until the
+    # window is deep enough removed the join hint from precisely the
+    # cold-start reloads that need it, and made the tag set itself change
+    # mid-session. A window shorter than the offset simply clamps the join
+    # to the start of the window, which is what a player without the tag
+    # already does, so nothing regresses on a thin window. It pins the join
+    # point deterministically across players; a client that sets its own
+    # offset still overrides it.
+    lines.append(f"#EXT-X-START:TIME-OFFSET=-{start_offset:.3f},PRECISE=YES")
     for entry in window:
         if entry.get("disc"):
             lines.append("#EXT-X-DISCONTINUITY")

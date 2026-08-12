@@ -40,6 +40,17 @@ DEFAULT_SEGMENT_DURATION = 4
 # briefly falls behind (a stall, a slow network hiccup) can still fetch the
 # segment it is on instead of getting a 404 once it has rolled off.
 DEFAULT_WINDOW_SIZE = 10
+# Headroom multiplier for the frozen EXT-X-TARGETDURATION over the cut
+# target. This is not just a ceiling on EXTINF: a client that reloads an
+# UNCHANGED media playlist must wait one-half TARGETDURATION before
+# retrying (RFC 8216 6.3.4), so every point of headroom is also latency a
+# player pays when it asks for the next segment a moment too early. At 2x
+# a 4s target that back-off was 4s - long enough to turn a sub-second wait
+# for the next segment into a visible freeze. 1.5x still clears a normal
+# cut (which lands at the first keyframe at or after the target) by a
+# comfortable GOP, and the segmenter force-cuts anything that would exceed
+# it, so the advertised value stays truthful.
+DEFAULT_TARGET_HEADROOM = 1.5
 
 # Demand self-check. HLS clients are pull-based: there is no long-lived
 # response whose teardown reports the disconnect, so the manager itself
@@ -71,11 +82,17 @@ class HLSOutputManager:
         self.window_size = ConfigHelper.get('HLS_WINDOW_SIZE', DEFAULT_WINDOW_SIZE)
         # Advertised EXT-X-TARGETDURATION, computed ONCE and frozen for the life
         # of the playlist (RFC 8216 6.2.1: it MUST NOT change across reloads;
-        # AVPlayer latches it at first parse and revalidates every reload). 2x
-        # the cut target gives one GOP of headroom past the cut threshold so a
-        # normal segment never exceeds it; the segmenter force-cuts anything that
-        # would, keeping the frozen value truthful (RFC 8216 4.3.3.1).
-        self.adv_target = int(2 * self.segment_duration + 0.999)
+        # AVPlayer latches it at first parse and revalidates every reload).
+        # DEFAULT_TARGET_HEADROOM over the cut target gives a GOP of room past
+        # the cut threshold so a normal segment never exceeds it; the segmenter
+        # force-cuts anything that would, keeping the frozen value truthful
+        # (RFC 8216 4.3.3.1). Kept as tight as that allows because it doubles as
+        # the client's unchanged-playlist reload back-off (see the constant).
+        headroom = ConfigHelper.get('HLS_TARGET_HEADROOM', DEFAULT_TARGET_HEADROOM)
+        self.adv_target = max(
+            int(float(headroom) * self.segment_duration + 0.999),
+            int(self.segment_duration) + 1,
+        )
 
         # Same Redis-backed chunk store the fMP4 manager uses; it is
         # format-parameterized by design ("adding a new output format only

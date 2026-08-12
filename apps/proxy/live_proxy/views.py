@@ -1323,32 +1323,53 @@ def hls_playlist(request, channel_id, client_id):
 
         fmt = _hls_resolved_format(client_hash)
 
-        # The segmenter needs a couple of segments after a cold start; wait
-        # briefly (gevent-friendly) instead of bouncing the player.
+        from .output.hls.segmenter import render_media_playlist, window_sustains_playback
+
+        # The segmenter needs a few segments after a cold start; wait briefly
+        # (gevent-friendly) instead of bouncing the player, and keep waiting
+        # past the first segment until the window can sustain playback (see
+        # window_sustains_playback). Warm channels satisfy this on the first
+        # read and never enter the loop.
         playlist_key = RedisKeys.output_playlist(channel_id, fmt)
         deadline = time.time() + 10
-        playlist_json = redis_client.get(playlist_key)
-        while not playlist_json and time.time() < deadline:
+        playlist_state = None
+        while True:
+            playlist_json = redis_client.get(playlist_key)
+            if playlist_json:
+                try:
+                    parsed = json.loads(playlist_json)
+                except ValueError as e:
+                    logger.error(
+                        f"[{client_id}] Malformed HLS playlist state for {channel_id}: {e}"
+                    )
+                    return JsonResponse({"error": "Playlist unavailable"}, status=500)
+                # Keep the freshest read even when it is still too thin: if the
+                # deadline expires, a short playlist beats no playlist.
+                playlist_state = parsed
+                if window_sustains_playback(
+                    parsed.get("window") or [], parsed.get("target", 4)
+                ):
+                    break
+
+            if time.time() >= deadline:
+                break
             state = redis_client.get(RedisKeys.output_state(channel_id, fmt))
             if state == 'stopped' or _hls_session_gone(channel_id, client_id):
                 return JsonResponse({"error": "Stream stopped"}, status=410)
             gevent.sleep(0.25)
-            playlist_json = redis_client.get(playlist_key)
 
-        if not playlist_json:
+        if not playlist_state:
             response = JsonResponse({"error": "Stream not ready"}, status=503)
             response["Retry-After"] = "2"
             return response
 
-        from .output.hls.segmenter import render_media_playlist
         try:
-            state = json.loads(playlist_json)
             body = render_media_playlist(
-                state.get("window", []),
-                state.get("target", 4),
-                adv_target=state.get("adv_target"),
+                playlist_state.get("window", []),
+                playlist_state.get("target", 4),
+                adv_target=playlist_state.get("adv_target"),
             )
-        except (ValueError, KeyError) as e:
+        except (ValueError, KeyError, TypeError) as e:
             logger.error(f"[{client_id}] Malformed HLS playlist state for {channel_id}: {e}")
             return JsonResponse({"error": "Playlist unavailable"}, status=500)
 

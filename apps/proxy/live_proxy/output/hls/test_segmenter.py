@@ -15,6 +15,7 @@ from .segmenter import (
     parse_pat,
     parse_pmt,
     render_media_playlist,
+    window_sustains_playback,
     starts_keyframe,
 )
 
@@ -127,10 +128,11 @@ def feed_stream(segmenter, gop_seconds, gop_count, start_pts=10.0, fillers_per_g
 
 
 class SegmenterTests(unittest.TestCase):
-    def make_started(self, target=4.0, startup_cuts=0):
-        # startup_cuts=0 keeps most tests on steady-state behavior; the
-        # fast-start ladder has its own dedicated test.
-        seg = TSSegmenter(target_duration=target, startup_keyframe_cuts=startup_cuts)
+    def make_started(self, target=4.0, startup_cuts=0, ramp=()):
+        # startup_cuts=0 / no ramp keeps most tests on steady-state behavior;
+        # the fast-start ladder has its own dedicated tests.
+        seg = TSSegmenter(target_duration=target, startup_keyframe_cuts=startup_cuts,
+                          startup_ramp_fractions=ramp)
         seg.feed(make_pat())
         seg.feed(make_pmt())
         return seg
@@ -142,6 +144,34 @@ class SegmenterTests(unittest.TestCase):
         # A cold channel accumulates media at live cadence, so the first
         # segments cut at EVERY keyframe (one 2s GOP each) to get a
         # playable window up fast; the normal 4s target then resumes.
+        self.assertEqual(durs[:3], [2.0, 2.0, 2.0])
+        self.assertTrue(all(abs(d - 4.0) < 0.01 for d in durs[3:]), durs)
+
+    def test_fast_start_ramps_back_to_target(self):
+        # The starter segments are cut from the pre-roll backlog, so they are
+        # produced far faster than 1x; the first full-target segment after them
+        # is the first produced at live cadence. Stepping straight from a 1-GOP
+        # starter to a full 4s target puts that jump exactly where the player's
+        # starter buffer runs dry. The ramp keeps the grain fine across the
+        # handover: 0.5x then 0.75x of the target before steady state.
+        seg = self.make_started(target=4.0, startup_cuts=3, ramp=(0.5, 0.75))
+        finished = feed_stream(seg, gop_seconds=2.0, gop_count=11)
+        durs = [round(s.duration, 3) for s in finished]
+        self.assertEqual(durs, [2.0, 2.0, 2.0, 2.0, 4.0, 4.0, 4.0])
+
+    def test_fast_start_ramp_never_exceeds_target(self):
+        # Every ramp EXTINF must stay at or under the steady-state target, so
+        # the frozen TARGETDURATION derived from it is never contradicted.
+        seg = self.make_started(target=4.0, startup_cuts=4, ramp=(0.5, 0.75))
+        finished = feed_stream(seg, gop_seconds=1.0, gop_count=24)
+        self.assertTrue(all(s.duration <= 4.0 + 1e-6 for s in finished),
+                        [s.duration for s in finished])
+
+    def test_fast_start_ramp_can_be_disabled(self):
+        # An empty ramp restores the original cliff: starters, then target.
+        seg = self.make_started(target=4.0, startup_cuts=3, ramp=())
+        durs = [round(s.duration, 3)
+                for s in feed_stream(seg, gop_seconds=2.0, gop_count=9)]
         self.assertEqual(durs[:3], [2.0, 2.0, 2.0])
         self.assertTrue(all(abs(d - 4.0) < 0.01 for d in durs[3:]), durs)
 
@@ -256,8 +286,7 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXTINF:4.200,", text)
         self.assertIn("8.ts", text)
         self.assertNotIn("#EXT-X-ENDLIST", text)             # live
-        # Live-edge start frozen at 2.5x the config target (2.5*4=10), emitted
-        # because the window (12.1s) is deep enough to honor it.
+        # Live-edge start frozen at 2.5x the config target (2.5*4=10).
         self.assertIn("#EXT-X-START:TIME-OFFSET=-10.000,PRECISE=YES", text)
         # Discontinuity tag must precede its segment
         lines = text.splitlines()
@@ -268,6 +297,29 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:0", text)
         self.assertIn("#EXT-X-TARGETDURATION:4", text)       # ceil(4)
         self.assertNotIn("#EXT-X-START", text)               # no segments to offset from
+
+    def test_start_offset_present_on_a_thin_cold_start_window(self):
+        # The join hint is emitted from the first playlist onward. Withholding
+        # it until the window was deep enough removed it from precisely the
+        # cold-start reloads that need it, and changed the tag set mid-session.
+        # A window shorter than the offset just clamps the join to the window
+        # start, which is what a player without the tag already does.
+        thin = [{"seq": 0, "dur": 1.9, "disc": False}, {"seq": 1, "dur": 2.0, "disc": False}]
+        text = render_media_playlist(thin, 4, adv_target=6)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-10.000,PRECISE=YES", text)
+
+    def test_start_offset_identical_from_cold_start_to_steady_state(self):
+        # RFC 8216 6.2.1 stability: the tag is byte-identical as the window
+        # grows from the starter ladder to a full steady-state window.
+        cold = [{"seq": 0, "dur": 1.9, "disc": False}]
+        ramp = [{"seq": 0, "dur": 1.9, "disc": False}, {"seq": 1, "dur": 2.0, "disc": False},
+                {"seq": 2, "dur": 4.0, "disc": False}]
+        warm = [{"seq": i, "dur": 4.0, "disc": False} for i in range(10)]
+        emitted = set()
+        for w in (cold, ramp, warm):
+            text = render_media_playlist(w, 4, adv_target=6)
+            emitted.update(ln for ln in text.splitlines() if ln.startswith("#EXT-X-START"))
+        self.assertEqual(len(emitted), 1)
 
     def test_targetduration_constant_across_window_shift(self):
         # RFC 8216 6.2.1: TARGETDURATION MUST NOT change across reloads. With a
@@ -290,6 +342,56 @@ class PlaylistTests(unittest.TestCase):
                 self.assertLessEqual(round(e["dur"]), adv)
         self.assertEqual(len(tds), 1)      # never changed
         self.assertEqual(len(starts), 1)   # EXT-X-START also byte-stable
+
+
+class StartWindowTests(unittest.TestCase):
+    """The gate that decides when a cold-start playlist may be served."""
+
+    def test_single_starter_segment_is_not_enough(self):
+        # This is the shape that stalled players: one ~1.5s starter segment,
+        # served the instant it existed.
+        self.assertFalse(window_sustains_playback([{"seq": 0, "dur": 1.5}], 4))
+
+    def test_three_short_starters_under_one_target_is_not_enough(self):
+        # Three segments but only 3s of media: the player begins effectively at
+        # the live edge and starves on the next cut.
+        w = [{"seq": i, "dur": 1.0} for i in range(3)]
+        self.assertFalse(window_sustains_playback(w, 4))
+
+    def test_starter_ladder_of_three_gops_is_enough(self):
+        # The ladder's own output: three 2s GOP segments, 6s >= one 4s target.
+        w = [{"seq": i, "dur": 2.0} for i in range(3)]
+        self.assertTrue(window_sustains_playback(w, 4))
+
+    def test_two_long_segments_still_wait_for_a_third(self):
+        # Duration alone is not sufficient; players want a few segments listed.
+        self.assertTrue(sum([5.0, 5.0]) >= 4)
+        self.assertFalse(
+            window_sustains_playback([{"seq": 0, "dur": 5.0}, {"seq": 1, "dur": 5.0}], 4)
+        )
+
+    def test_rolled_window_is_never_gated(self):
+        # Mid-session: the window has rolled (seq > 0), so the channel has long
+        # since produced a full window. Whatever it holds right now must be
+        # served immediately - blocking a reload would stall a playing client,
+        # which is the exact failure this gate exists to prevent.
+        self.assertTrue(window_sustains_playback([{"seq": 41, "dur": 0.5}], 4))
+
+    def test_warm_window_passes_immediately(self):
+        w = [{"seq": i, "dur": 4.0} for i in range(10)]
+        self.assertTrue(window_sustains_playback(w, 4))
+
+    def test_empty_and_malformed_windows_do_not_raise(self):
+        self.assertFalse(window_sustains_playback([], 4))
+        self.assertFalse(window_sustains_playback(None, 4))
+        # A descriptor missing or corrupting "dur" must not 500 the endpoint;
+        # it simply contributes nothing to the measured depth.
+        w = [{"seq": 0}, {"seq": 1, "dur": None}, {"seq": 2, "dur": "x"}]
+        self.assertFalse(window_sustains_playback(w, 4))
+
+    def test_non_numeric_target_falls_back(self):
+        w = [{"seq": i, "dur": 2.0} for i in range(3)]
+        self.assertTrue(window_sustains_playback(w, None))
 
 
 if __name__ == "__main__":

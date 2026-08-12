@@ -194,7 +194,8 @@ class TSSegmenter:
     """
 
     def __init__(self, target_duration=4.0, max_segment_duration=None,
-                 startup_keyframe_cuts=4, startup_ramp_fractions=(0.5, 0.75)):
+                 startup_keyframe_cuts=4, startup_ramp_fractions=(0.5, 0.75),
+                 startup_min_duration=1.0):
         self.target_duration = float(target_duration)
         # Hard ceiling: force a cut before a segment can exceed this, so no
         # emitted EXTINF ever exceeds the frozen advertised TARGETDURATION even
@@ -223,6 +224,15 @@ class TSSegmenter:
             float(f) * self.target_duration for f in (startup_ramp_fractions or ())
             if 0 < float(f) < 1
         ]
+        # Floor on starter segment length. Cutting at EVERY keyframe means the
+        # ladder acts on every keyframe the detector reports - including false
+        # positives from the NAL fallback scan, which a steady-state target
+        # threshold silently absorbs. Observed on a live source: starters of
+        # 0.97s, 1.03s and 0.30s where the real GOP was 2.0s, so the four
+        # starter slots carried 4.3s of runway instead of ~8s. The floor costs
+        # nothing when keyframes are honest (a 2s GOP still cuts at 2s) and
+        # stops a spurious keyframe from spending a starter slot on a fragment.
+        self.startup_min_duration = float(startup_min_duration or 0)
         self._pending = bytearray()
         self._current = bytearray()
         self._pat_packet = None
@@ -371,9 +381,9 @@ class TSSegmenter:
         step in turn, then the steady-state target.
         """
         if self._startup_cuts_remaining > 0:
-            return 0.0
+            return self.startup_min_duration
         if self._startup_ramp:
-            return self._startup_ramp[0]
+            return max(self._startup_ramp[0], self.startup_min_duration)
         return self.target_duration
 
     def _elapsed(self, pts, start):
@@ -436,39 +446,38 @@ class TSSegmenter:
 MIN_START_SEGMENTS = 3
 
 
-def window_sustains_playback(window, target_duration, min_segments=MIN_START_SEGMENTS):
+def window_sustains_playback(window, target_duration, adv_target=None,
+                             min_segments=MIN_START_SEGMENTS):
     """True when a window is deep enough to hand to a player.
 
-    Requires both a segment count (players want a few segments before they
-    will start) and at least one full cut target of media, so the player is
-    not already sitting at the live edge the moment playback begins.
+    Requires a segment count (players want a few segments listed before they
+    will start) AND enough media to cover the worst-case wait for the next
+    segment. That worst case is the force-cut ceiling - the frozen
+    TARGETDURATION - not the nominal cut target: a segment may legitimately
+    take until the ceiling to close, and measured on a live source the first
+    post-ladder segment took 5.1s of wall clock against a 4s target. Gating
+    on the target alone let a 4.3s window through and left the player about
+    a second short.
 
-    Only ever gates a COLD start. Once the window has rolled (its first media
-    sequence has advanced past zero) the channel has produced a full window's
-    worth of segments, and any thinness is transient - a mid-session reload
-    must be answered immediately, since making a playing client wait is the
-    very stall this gate exists to prevent.
+    Only ever gates a COLD start. The window is trimmed to a fixed size and
+    never shrinks once full, so a window too short to pass here is by
+    definition one that has not filled yet. A mid-session reload is answered
+    immediately - making a playing client wait is the very stall this exists
+    to prevent.
     """
-    if not window:
+    if not window or len(window) < min_segments:
         return False
     try:
-        if int(window[0].get("seq", 0)) > 0:
-            return True
-    except (AttributeError, TypeError, ValueError):
-        pass
-    if len(window) < min_segments:
-        return False
-    try:
-        target = float(target_duration)
+        needed = float(adv_target) if adv_target else float(target_duration)
     except (TypeError, ValueError):
-        target = 4.0
+        needed = 4.0
     total = 0.0
     for entry in window:
         try:
             total += float(entry.get("dur") or 0)
         except (AttributeError, TypeError, ValueError):
             continue
-    return total >= target
+    return total >= needed
 
 
 def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_target=None):

@@ -1347,7 +1347,9 @@ def hls_playlist(request, channel_id, client_id):
                 # deadline expires, a short playlist beats no playlist.
                 playlist_state = parsed
                 if window_sustains_playback(
-                    parsed.get("window") or [], parsed.get("target", 4)
+                    parsed.get("window") or [],
+                    parsed.get("target", 4),
+                    adv_target=parsed.get("adv_target"),
                 ):
                     break
 

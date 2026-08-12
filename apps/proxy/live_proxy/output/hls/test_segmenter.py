@@ -167,6 +167,41 @@ class SegmenterTests(unittest.TestCase):
         self.assertTrue(all(s.duration <= 4.0 + 1e-6 for s in finished),
                         [s.duration for s in finished])
 
+    def test_starter_floor_absorbs_short_spurious_keyframes(self):
+        # A false-positive keyframe early in a real 2s GOP must not spend a
+        # starter slot on a fragment. Observed live: starters of 0.97/1.03/
+        # 0.30s against a 2.0s GOP, leaving the player 4.3s of runway where
+        # the ladder was meant to hand it ~8s.
+        #
+        # The floor only claims to suppress cuts SHORTER than itself - a
+        # spurious keyframe past 1.0s still cuts (the 1.03s starter above
+        # would survive). Guaranteeing runway is the serving gate's job, not
+        # this floor's; see window_sustains_playback.
+        seg = self.make_started(target=4.0, startup_cuts=4, ramp=())
+        out = []
+        pts = 10.0
+        for i in range(8):
+            out += seg.feed(make_video_pes(pts, keyframe=True))          # real GOP
+            out += seg.feed(make_video_pes(pts + 0.3, keyframe=True))    # spurious
+            pts += 2.0
+        durs = [round(s.duration, 3) for s in out]
+        self.assertTrue(all(d >= 1.0 for d in durs), durs)
+        # Every cut lands on a real GOP boundary, so the starters carry a
+        # full 2s each rather than alternating with 0.3s fragments.
+        self.assertTrue(all(abs(d - 2.0) < 0.01 for d in durs[:4]), durs)
+
+    def test_starter_floor_off_restores_cut_at_every_keyframe(self):
+        seg = self.make_started(target=4.0, startup_cuts=4, ramp=())
+        seg.startup_min_duration = 0.0
+        out = []
+        pts = 10.0
+        for i in range(4):
+            out += seg.feed(make_video_pes(pts, keyframe=True))
+            out += seg.feed(make_video_pes(pts + 0.3, keyframe=True))
+            pts += 2.0
+        self.assertTrue(any(round(s.duration, 3) == 0.3 for s in out),
+                        [s.duration for s in out])
+
     def test_fast_start_ramp_can_be_disabled(self):
         # An empty ramp restores the original cliff: starters, then target.
         seg = self.make_started(target=4.0, startup_cuts=3, ramp=())
@@ -359,9 +394,25 @@ class StartWindowTests(unittest.TestCase):
         self.assertFalse(window_sustains_playback(w, 4))
 
     def test_starter_ladder_of_three_gops_is_enough(self):
-        # The ladder's own output: three 2s GOP segments, 6s >= one 4s target.
+        # The ladder's own output: three 2s GOP segments, 6s >= the 6s ceiling.
         w = [{"seq": i, "dur": 2.0} for i in range(3)]
-        self.assertTrue(window_sustains_playback(w, 4))
+        self.assertTrue(window_sustains_playback(w, 4, adv_target=6))
+
+    def test_gate_measures_against_the_ceiling_not_the_target(self):
+        # The window observed live when the stall survived: 4 starters, 4.3s.
+        # It cleared a 4s target but the next segment took 5.1s to arrive, so
+        # the player was left about a second short. Against the 6s ceiling it
+        # correctly waits for more.
+        w = [{"seq": 1, "dur": 0.968}, {"seq": 2, "dur": 1.034},
+             {"seq": 3, "dur": 2.002}, {"seq": 4, "dur": 0.300}]
+        self.assertTrue(window_sustains_playback(w, 4))            # target only
+        self.assertFalse(window_sustains_playback(w, 4, adv_target=6))
+
+    def test_first_session_window_starts_at_seq_one(self):
+        # The chunk index backing the media sequence starts at 1, not 0, so
+        # nothing here may treat a nonzero first seq as proof the window has
+        # rolled - that read served a cold 1-segment playlist unguarded.
+        self.assertFalse(window_sustains_playback([{"seq": 1, "dur": 2.0}], 4, adv_target=6))
 
     def test_two_long_segments_still_wait_for_a_third(self):
         # Duration alone is not sufficient; players want a few segments listed.
@@ -371,11 +422,15 @@ class StartWindowTests(unittest.TestCase):
         )
 
     def test_rolled_window_is_never_gated(self):
-        # Mid-session: the window has rolled (seq > 0), so the channel has long
-        # since produced a full window. Whatever it holds right now must be
-        # served immediately - blocking a reload would stall a playing client,
-        # which is the exact failure this gate exists to prevent.
-        self.assertTrue(window_sustains_playback([{"seq": 41, "dur": 0.5}], 4))
+        # Mid-session the window is full and slides, so it always clears both
+        # conditions and a reload is answered immediately - blocking one would
+        # stall a playing client, the exact failure this gate exists to
+        # prevent. A high first seq is NOT what establishes this (sequences
+        # start at 1, so that test would pass on the very first segment); a
+        # window too short to clear the gate is by definition one that has not
+        # filled yet.
+        rolled = [{"seq": 40 + i, "dur": 4.0} for i in range(10)]
+        self.assertTrue(window_sustains_playback(rolled, 4, adv_target=6))
 
     def test_warm_window_passes_immediately(self):
         w = [{"seq": i, "dur": 4.0} for i in range(10)]

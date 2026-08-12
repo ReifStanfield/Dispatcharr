@@ -16,6 +16,9 @@ from .segmenter import (
     parse_pmt,
     render_media_playlist,
     window_sustains_playback,
+    client_is_stale,
+    client_stale_after,
+    CLIENT_STALE_FLOOR,
     LIVE_EDGE_OFFSET_FACTOR,
     starts_keyframe,
 )
@@ -539,6 +542,52 @@ class StartWindowTests(unittest.TestCase):
         self.assertFalse(window_sustains_playback(w, None))
         w = [{"seq": i, "dur": 4.0} for i in range(3)]     # 12.0s
         self.assertTrue(window_sustains_playback(w, None))
+
+
+class ClientStalenessTests(unittest.TestCase):
+    """When a pull-based client is judged gone, releasing its upstream slot."""
+
+    def test_stale_window_is_three_polls_with_a_floor(self):
+        # A player reloads about once per TARGETDURATION, which now equals the
+        # cut target, so three missed reloads is unambiguous.
+        self.assertEqual(client_stale_after(10), 30.0)
+        # ...but a short target must not let one slow moment reap a client.
+        self.assertEqual(client_stale_after(4), CLIENT_STALE_FLOOR)
+        self.assertEqual(client_stale_after(1), CLIENT_STALE_FLOOR)
+
+    def test_stale_window_survives_a_junk_target(self):
+        self.assertEqual(client_stale_after(None), CLIENT_STALE_FLOOR)
+        self.assertEqual(client_stale_after("x"), CLIENT_STALE_FLOOR)
+
+    def test_recent_fetch_is_not_stale(self):
+        now = 1000.0
+        self.assertFalse(client_is_stale(str(now - 4), now, 15))
+        self.assertFalse(client_is_stale(str(now - 14.9), now, 15))
+
+    def test_missed_polls_are_stale(self):
+        now = 1000.0
+        self.assertTrue(client_is_stale(str(now - 15.1), now, 15))
+        self.assertTrue(client_is_stale(str(now - 300), now, 15))
+
+    def test_redis_returns_bytes(self):
+        now = 1000.0
+        self.assertTrue(client_is_stale(b"985.0", now, 14))
+        self.assertFalse(client_is_stale(b"999.0", now, 14))
+
+    def test_unreadable_timestamp_is_never_stale(self):
+        # A record created by the entry handshake that has not fetched
+        # anything yet must not be reaped as the session is being set up.
+        now = 1000.0
+        self.assertFalse(client_is_stale(None, now, 15))
+        self.assertFalse(client_is_stale("", now, 15))
+        self.assertFalse(client_is_stale("not-a-number", now, 15))
+        self.assertFalse(client_is_stale(b"\xff\xfe", now, 15))
+
+    def test_clock_skew_does_not_reap(self):
+        # A timestamp in the future (worker clock drift) reads as very recent,
+        # never as stale.
+        now = 1000.0
+        self.assertFalse(client_is_stale(str(now + 60), now, 15))
 
 
 if __name__ == "__main__":

@@ -507,6 +507,46 @@ MIN_START_SEGMENTS = 3
 LIVE_EDGE_OFFSET_FACTOR = 2.5
 
 
+# How many missed playlist fetches mark an HLS client as gone, and the floor
+# under that in seconds.
+#
+# A pull-based client cannot report a disconnect, so its absence has to be
+# inferred - but it can be inferred far faster than the generic
+# CLIENT_RECORD_TTL allows. A player reloads the media playlist about once
+# per TARGETDURATION (RFC 8216 6.3.4), and TARGETDURATION now equals the cut
+# target, so three missed reloads is unambiguous. The floor keeps a short
+# target from reaping a client over one slow network moment.
+CLIENT_STALE_POLL_MULTIPLE = 3
+CLIENT_STALE_FLOOR = 15.0
+
+
+def client_stale_after(target_duration):
+    """Seconds without a playlist or segment fetch after which an HLS client
+    is treated as gone, so its upstream slot can be released."""
+    try:
+        target = float(target_duration)
+    except (TypeError, ValueError):
+        target = 4.0
+    return max(CLIENT_STALE_POLL_MULTIPLE * target, CLIENT_STALE_FLOOR)
+
+
+def client_is_stale(last_active, now, stale_after):
+    """True when a client's last fetch is old enough to call it gone.
+
+    An unreadable or missing timestamp is never stale: the record may have
+    been created a moment ago by the entry handshake and not yet fetched
+    anything, and reaping that would kill a session as it is being set up.
+    """
+    if last_active is None:
+        return False
+    if isinstance(last_active, bytes):
+        last_active = last_active.decode(errors="replace")
+    try:
+        return (float(now) - float(last_active)) > float(stale_after)
+    except (TypeError, ValueError):
+        return False
+
+
 def window_sustains_playback(window, target_duration,
                              min_segments=MIN_START_SEGMENTS):
     """True when a window is deep enough to hand to a player.

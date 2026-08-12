@@ -17,7 +17,7 @@ import time
 
 from core.utils import RedisClient
 from ..fmp4.buffer import FMP4StreamBuffer
-from .segmenter import TSSegmenter
+from .segmenter import TSSegmenter, client_is_stale, client_stale_after
 from ...redis_keys import RedisKeys
 from ...config_helper import ConfigHelper
 from ...utils import get_logger
@@ -63,10 +63,16 @@ TARGET_ROUNDING_SLACK = 0.35
 
 # Demand self-check. HLS clients are pull-based: there is no long-lived
 # response whose teardown reports the disconnect, so the manager itself
-# periodically verifies that at least one live client record still names
-# this output, and retires through the server's shared demand accounting
-# when none has for two consecutive checks.
-DEMAND_CHECK_INTERVAL = 10
+# periodically verifies that at least one client is still FETCHING this
+# output, and retires through the server's shared demand accounting when
+# none has for two consecutive checks.
+#
+# The interval is part of how long an upstream connection - and the provider
+# slot behind it - outlives the player that wanted it. Total release time is
+# roughly the staleness window (see client_stale_after) plus up to
+# GRACE x INTERVAL, so a slow poll here directly delays freeing a slot for
+# the next tune-in. Cheap to run: one pipelined read of the client set.
+DEMAND_CHECK_INTERVAL = 5
 DEMAND_GRACE_CHECKS = 2
 
 
@@ -343,10 +349,21 @@ class HLSOutputManager:
     # ------------------------------------------------------------------
 
     def _has_hls_demand(self):
-        """True when at least one live client record consumes this manager's
+        """True when at least one client is still FETCHING this manager's
         output. Mirrors the per-format accounting in handle_client_disconnect;
         set entries whose metadata hash has expired are ghosts and do not
-        count as demand."""
+        count as demand.
+
+        Existence of the record is not enough. A pull-based client cannot
+        report a disconnect, so its record simply sits at whatever TTL it was
+        last given (CLIENT_RECORD_TTL, a minute) after the player has stopped
+        polling - and for that whole minute the upstream connection, and the
+        provider slot behind it, stays claimed. A streaming client releases
+        its slot the moment its response tears down; this closes most of that
+        gap by judging demand on when a client last actually fetched, and by
+        releasing the records that fail that test instead of waiting for them
+        to lapse on their own.
+        """
         if not self._redis:
             return True  # cannot verify; err on the side of running
         try:
@@ -355,15 +372,22 @@ class HLSOutputManager:
                 return False
             pipe = self._redis.pipeline(transaction=False)
             for cid in client_ids:
-                pipe.hget(RedisKeys.client_metadata(self.channel_id, cid), "output_format")
-                pipe.hget(RedisKeys.client_metadata(self.channel_id, cid), "output_profile_id")
+                key = RedisKeys.client_metadata(self.channel_id, cid)
+                pipe.hget(key, "output_format")
+                pipe.hget(key, "output_profile_id")
+                pipe.hget(key, "last_active")
             results = pipe.execute()
-            for i in range(0, len(results), 2):
-                fmt = results[i]
+
+            now = time.time()
+            stale_after = client_stale_after(self.segment_duration)
+            demand = False
+            stale_ids = []
+            for idx, cid in enumerate(client_ids):
+                fmt = results[idx * 3]
                 if not fmt:
                     continue  # expired hash: a ghost entry, not demand
                 fmt = fmt.decode() if isinstance(fmt, bytes) else fmt
-                pid = results[i + 1]
+                pid = results[idx * 3 + 1]
                 pid = (pid.decode() if isinstance(pid, bytes) else pid) if pid else ''
                 manager_key = fmt
                 if pid:
@@ -371,12 +395,58 @@ class HLSOutputManager:
                         manager_key = f"{fmt}:p{int(pid)}"
                     except ValueError:
                         pass
-                if manager_key == self.fmt:
-                    return True
-            return False
+                if manager_key != self.fmt:
+                    continue
+                if client_is_stale(results[idx * 3 + 2], now, stale_after):
+                    stale_ids.append(cid)
+                else:
+                    demand = True
+
+            if stale_ids:
+                self._release_stale_clients(stale_ids, stale_after)
+            return demand
         except Exception as e:
             logger.debug(f"[HLS:{self.channel_id}] Demand check failed: {e}")
             return True
+
+    def _release_stale_clients(self, client_ids, stale_after):
+        """Drop clients that stopped fetching, as a disconnect would.
+
+        Deleting the metadata hash is the part that matters: the channel's
+        shared accounting counts a client while its hash exists, so leaving
+        the record to expire on its own is exactly what held the upstream
+        open for a minute after the player went away.
+        """
+        try:
+            from ...server import ProxyServer
+            mgr = ProxyServer.get_instance().client_managers.get(self.channel_id)
+        except Exception:
+            mgr = None
+        for cid in client_ids:
+            cid_str = cid.decode() if isinstance(cid, bytes) else cid
+            try:
+                if mgr:
+                    # Preferred: goes through the same bookkeeping (and the
+                    # same last-client-disconnect trigger) a streaming
+                    # client's teardown uses.
+                    mgr.remove_client(cid_str)
+                    continue
+                # Owner runs on another worker: mirror what remove_client
+                # does to Redis, matching _drop_pre_registered_client.
+                self._redis.srem(RedisKeys.clients(self.channel_id), cid_str)
+                self._redis.delete(
+                    RedisKeys.client_metadata(self.channel_id, cid_str)
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[HLS:{self.channel_id}] Could not release stale client "
+                    f"{cid_str}: {e}"
+                )
+        logger.info(
+            f"[HLS:{self.channel_id}] Released {len(client_ids)} client(s) with no "
+            f"fetch in {stale_after:.0f}s; upstream slot freed without waiting "
+            f"out the client record TTL"
+        )
 
     def _retire(self):
         """No consumers remain: prune expired client-set entries, then hand

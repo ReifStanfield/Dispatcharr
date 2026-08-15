@@ -80,6 +80,71 @@ the window holds enough media to sustain playback, rather than handing a
 player a one-segment playlist it will drain and stall on. An established
 channel satisfies this on the first read and never waits.
 
+## Low-Latency HLS
+
+When `HLS_PART_TARGET` is greater than zero (default 0.5s) the media playlist
+is a Low-Latency HLS playlist (rfc8216bis). The in-progress segment is
+published as **partial segments** as it fills, so a client can ride the live
+edge within ~1.5s instead of the ~3 target durations a whole-segment live
+playlist forces.
+
+The LL playlist additionally carries:
+
+- `#EXT-X-VERSION:10`
+- `#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=<3 x PART-TARGET>`
+- `#EXT-X-PART-INF:PART-TARGET=<n>`
+- `#EXT-X-PART:DURATION=<n>,URI="p<seq>.<part>.ts"` lines for the three most
+  recent completed segments and for the segment currently being produced. The
+  first part of each segment carries `INDEPENDENT=YES` (it begins on the
+  keyframe and carries PAT/PMT).
+- `#EXT-X-PRELOAD-HINT:TYPE=PART,URI="..."` naming the next part
+- `#EXT-X-PROGRAM-DATE-TIME` on every segment (required by Apple's Low-Latency
+  Server Configuration Profile; it also drives AVPlayer's
+  `recommendedTimeOffsetFromLive`)
+
+`EXT-X-START` is deliberately **not** emitted in LL mode: `PART-HOLD-BACK` is
+the spec's native live-edge positioning and takes precedence.
+
+`PART-TARGET` and `PART-HOLD-BACK`, like `TARGETDURATION`, are frozen for the
+life of the stream. The advertised `PART-TARGET` is the configured target times
+1.12, which keeps every real part at >=24fps inside the spec's 85% band while
+covering cadence jitter.
+
+### Blocking Playlist Reload
+
+The playlist endpoint honours the `_HLS_msn` and `_HLS_part` delivery
+directives (rfc8216bis 6.2.5.2). A request naming media the server has not
+published yet is held open (gevent-cooperative, so it does not tie up a
+worker) until that media appears, then answered with the fresh playlist.
+
+- `_HLS_part` without `_HLS_msn` is malformed and returns **400**.
+- An `_HLS_msn` far beyond the live edge means the client is out of sync and
+  returns **400**, telling it to reload from scratch.
+- If the hold deadline passes without the requested media appearing, the
+  response is **503** with `Retry-After`, never a 200 missing what the client
+  blocked on.
+- Concurrent holds are bounded per channel (128); requests over the ceiling
+  shed immediately with **503** rather than queueing.
+
+### Partial segment URLs
+
+Parts are served at `p<seq>.<part>.ts` relative to the playlist, i.e.
+`/proxy/hls/<channel_uuid>/<client_id>/p<seq>.<part>.ts`, with
+`Cache-Control: public, max-age=15, immutable`. A part of the in-progress
+segment that has been preload-hinted but not yet stored blocks briefly (up to
+3s) rather than 404-ing; a part of an already-closed segment 404s immediately.
+
+Parts are short-lived in Redis — once a segment closes, the whole segment
+serves any catch-up fetch.
+
+### Non-LL clients
+
+Set `HLS_PART_TARGET` to 0 to disable LL entirely and emit the version-3
+playlist described above. Note that with LL enabled the playlist advertises
+`EXT-X-VERSION:10`, which a client that does not implement version 10 is
+required by the spec to refuse — so this is the setting to reach for if an
+older player stops working.
+
 ## MIME types, caching, and CORS
 
 - Playlist responses use `Content-Type: application/vnd.apple.mpegurl` and
@@ -125,3 +190,5 @@ HLS output carries the source codec untouched in MPEG-TS segments.
 - `HLS_SEGMENT_DURATION` (default 4 seconds) - target segment length.
 - `HLS_WINDOW_SIZE` (default 10) - number of segments retained in the rolling
   live playlist.
+- `HLS_PART_TARGET` (default 0.5 seconds) - Low-Latency partial-segment target.
+  Set to 0 to disable LL-HLS and serve the plain version-3 playlist.

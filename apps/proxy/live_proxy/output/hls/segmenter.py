@@ -48,6 +48,22 @@ class Segment:
         self.discontinuity = discontinuity
 
 
+class Part:
+    """One Low-Latency HLS partial segment: a sub-second slice of the
+    in-progress segment, emitted before the segment closes so a client can
+    play within a part or two of the live edge. The concatenation of a
+    segment's parts equals that segment's bytes. ``independent`` is True only
+    for the first part of a segment (it begins on the keyframe + PAT/PMT, so a
+    client may start decoding there)."""
+
+    __slots__ = ("data", "duration", "independent")
+
+    def __init__(self, data, duration, independent=False):
+        self.data = data
+        self.duration = float(duration)
+        self.independent = independent
+
+
 def packet_pid(packet):
     """13-bit PID of a TS packet."""
     return ((packet[1] & 0x1F) << 8) | packet[2]
@@ -195,8 +211,20 @@ class TSSegmenter:
 
     def __init__(self, target_duration=4.0, max_segment_duration=None,
                  startup_keyframe_cuts=4, startup_ramp_fractions=(0.5, 0.75),
-                 startup_min_duration=1.0):
+                 startup_min_duration=1.0, part_target=0.0, part_ceiling=None):
         self.target_duration = float(target_duration)
+        # Low-Latency HLS: when > 0, emit Part objects every ~part_target
+        # seconds of the in-progress segment. 0 disables LL-HLS (segments only),
+        # which keeps the classic contract for the non-LL path and its tests.
+        self.part_target = float(part_target)
+        # Hard ceiling on any emitted part duration: the advertised PART-TARGET
+        # the manager freezes (adv_part). Every EXT-X-PART DURATION MUST be <=
+        # PART-TARGET (RFC 8216bis 4.4.4.9), so a part measured above the ceiling
+        # (only possible on sub-target frame cadence or a discontinuity tail) is
+        # clamped to it rather than advertised over the frozen maximum. Defaults
+        # to the same part_target * 1.12 the manager uses when not passed.
+        self._part_ceiling = float(part_ceiling) if part_ceiling else (
+            round(self.part_target * 1.12, 3) if self.part_target > 0 else 0.0)
         # Hard ceiling: force a cut before a segment can exceed this, so no
         # emitted EXTINF ever exceeds the frozen advertised TARGETDURATION even
         # on a keyframe drought (RFC 8216 4.3.3.1). Defaults to 2x the target.
@@ -257,6 +285,10 @@ class TSSegmenter:
         # at the first keyframe past the target.
         self._gop_estimate = None
         self._last_keyframe_pts = None
+        # Part accounting for the in-progress segment.
+        self._part_offset = 0        # byte index into _current where the open part began
+        self._part_start_pts = None  # PTS at the open part's first frame
+        self._part_index = 0         # 0-based part number within the current segment
 
     @property
     def video_detected(self):
@@ -270,6 +302,15 @@ class TSSegmenter:
         (notably HEVC-in-MPEG-TS, which AVFoundation refuses)."""
         return VIDEO_STREAM_TYPES.get(self._video_stream_type)
 
+    @property
+    def current_discontinuity(self):
+        """Whether the segment currently being collected began after a stream
+        discontinuity. The manager publishes this as building["disc"] so the
+        playlist can carry #EXT-X-DISCONTINUITY from the first render that lists
+        any of this segment's parts, rather than inserting it retroactively
+        before already-published EXT-X-PART lines (rfc8216bis 6.2.1)."""
+        return self._current_discontinuity
+
     def flag_discontinuity(self):
         """Mark a stream discontinuity (provider failover, buffer skip-ahead).
 
@@ -278,16 +319,20 @@ class TSSegmenter:
         segment. Collection resumes at the next keyframe, and that new segment
         is the one tagged with EXT-X-DISCONTINUITY.
 
-        Returns the finished pre-gap Segment, or None when the open segment
-        held nothing playable (its measured span is zero) and was discarded.
+        Returns a list of events: in LL mode the closing segment's final Part
+        (so a segment's parts still tile it exactly) followed by the finished
+        pre-gap Segment; otherwise just the Segment. Empty when the open
+        segment held nothing playable (its measured span is zero) and was
+        discarded.
         """
-        finished = None
+        events = []
         if self._collecting:
             span = 0.0
             if self._seg_first_pts is not None and self._seg_last_pts is not None:
                 span = self._elapsed(self._seg_last_pts, self._seg_first_pts)
             if span > 0:
-                finished = self._finish_segment(span)
+                self._emit_final_part(events, self._seg_last_pts)
+                events.append(self._finish_segment(span))
         # Drop any un-finished remainder and wait for the next keyframe; the
         # PTS timeline may jump arbitrarily across the discontinuity.
         self._collecting = False
@@ -297,11 +342,24 @@ class TSSegmenter:
         self._seg_first_pts = None
         self._seg_last_pts = None
         self._pending_discontinuity = True
-        return finished
+        # Suppress part emission until the next keyframe re-anchors it: a
+        # jumped PTS measured against the pre-jump part start would otherwise
+        # emit a garbage-duration part.
+        self._part_offset = 0
+        self._part_start_pts = None
+        self._part_index = 0
+        return events
 
     def feed(self, data):
-        """Consume raw TS bytes; return a list of finished Segments (possibly empty)."""
-        segments = []
+        """Consume raw TS bytes; return a list of events (possibly empty).
+
+        With ``part_target == 0`` every event is a finished ``Segment`` (the
+        classic non-LL contract). With ``part_target > 0`` the list interleaves
+        ``Part`` events (emitted as the in-progress segment fills) with the
+        ``Segment`` that closes them; a segment's ``Part`` events always precede
+        its ``Segment`` in the stream. Dispatch by type at the call site.
+        """
+        events = []
         self._pending.extend(data)
 
         while len(self._pending) >= TS_PACKET_SIZE:
@@ -323,20 +381,19 @@ class TSSegmenter:
 
             packet = bytes(self._pending[:TS_PACKET_SIZE])
             del self._pending[:TS_PACKET_SIZE]
-            finished = self._handle_packet(packet)
-            if finished is not None:
-                segments.append(finished)
+            events.extend(self._handle_packet(packet))
 
-        return segments
+        return events
 
     def _handle_packet(self, packet):
+        events = []
         pid = packet_pid(packet)
 
         if pid == 0:
             self._pat_packet = packet
             if self._pmt_pid is None:
                 self._pmt_pid = parse_pat(packet)
-            return None
+            return events
         if self._pmt_pid is not None and pid == self._pmt_pid:
             self._pmt_packet = packet
             video_pid, stream_type = parse_pmt(packet)
@@ -345,15 +402,21 @@ class TSSegmenter:
                 # provider failovers are tolerated.
                 self._video_pid = video_pid
                 self._video_stream_type = stream_type
-            return None
+            return events
 
         if self._video_pid is None:
-            return None
+            return events
 
-        finished = None
         if pid == self._video_pid and packet_pusi(packet):
             pts = extract_pts(packet)
             keyframe = starts_keyframe(packet, self._video_stream_type)
+            # The last frame that belonged to the segment currently being
+            # closed, captured BEFORE this packet's PTS overwrites it. A
+            # discontinuity keyframe carries the post-jump timeline, so
+            # measuring the closing segment against it would yield a garbage
+            # span; measure against the pre-jump tail instead (RFC 8216
+            # 4.3.2.1).
+            prev_last_pts = self._seg_last_pts
             if pts is not None:
                 self._seg_last_pts = pts
             if keyframe and pts is not None:
@@ -363,20 +426,33 @@ class TSSegmenter:
                 if keyframe:
                     self._begin_segment(pts)
             elif keyframe and pts is not None:
+                cut = False
+                duration = self.target_duration
                 if self._segment_start_pts is None:
                     # Discontinuity reset the timeline: cut here, reporting the
                     # measured span of the segment being closed (RFC 8216 4.3.2.1)
                     # rather than substituting the nominal target.
-                    finished = self._finish_segment(self._measured_span())
-                    self._begin_segment(pts)
+                    duration = self._measured_span(prev_last_pts)
+                    cut = True
                 else:
                     elapsed = self._elapsed(pts, self._segment_start_pts)
                     # Fast-start ladder, then ramp; elapsed > 0 skips
                     # same-PTS duplicates.
                     cut_at = self._cut_threshold()
                     if elapsed >= cut_at and elapsed > 0:
-                        finished = self._finish_segment(elapsed)
-                        self._begin_segment(pts)
+                        duration = elapsed
+                        cut = True
+                if cut:
+                    # Flush the segment's trailing bytes as its final part, then
+                    # the segment itself, then open the next segment (whose
+                    # part 0 begins on this keyframe).
+                    self._emit_final_part(events, pts)
+                    events.append(self._finish_segment(duration))
+                    self._begin_segment(pts)
+                else:
+                    # Keyframe before the cut threshold: still a PES boundary a
+                    # part may close on.
+                    self._maybe_emit_part(events, pts)
             elif pts is not None and self._collecting and self._segment_start_pts is not None:
                 # Keyframe drought: force a cut so the segment cannot exceed the
                 # frozen TARGETDURATION. Cutting mid-GOP yields a segment that is
@@ -385,12 +461,18 @@ class TSSegmenter:
                 # reaches.
                 elapsed = self._elapsed(pts, self._segment_start_pts)
                 if elapsed >= self.max_segment_duration:
-                    finished = self._finish_segment(elapsed)
+                    self._emit_final_part(events, pts)
+                    events.append(self._finish_segment(elapsed))
                     self._begin_segment(pts)
+                else:
+                    self._maybe_emit_part(events, pts)
+            else:
+                # Collecting, ordinary PES boundary: close the open part if due.
+                self._maybe_emit_part(events, pts)
 
         if self._collecting:
             self._current.extend(packet)
-        return finished
+        return events
 
     def _cut_threshold(self):
         """Elapsed time at which the next keyframe may close the segment.
@@ -448,22 +530,82 @@ class TSSegmenter:
         self._last_keyframe_pts = pts
 
     def _elapsed(self, pts, start):
-        """Wrap-safe presentation-time delta in seconds."""
+        """Presentation-time delta in seconds, tolerating a real 33-bit PTS wrap
+        (a huge negative jump) but NOT the small negative deltas that B-frame
+        reordering produces (presentation order != decode order). A small
+        negative is returned as-is (negative) so callers read it as "not enough
+        time yet" rather than adding ~95443s of wrap and reporting a garbage
+        duration. Only the half-wrap threshold distinguishes the two: a genuine
+        wrap is always a jump of nearly the full 33-bit range, while reorder
+        deltas are at most a GOP. Segment-length measurements survived the old
+        unconditional wrap because their guards rejected the absurd value, but
+        sub-second part durations are exactly where reorder shows up."""
         d = pts - start
-        if d < 0:
+        if d < -(PTS_WRAP / PTS_CLOCK) / 2:
             d += PTS_WRAP / PTS_CLOCK
         return d
 
-    def _measured_span(self):
-        """Best measured duration of the segment being closed, from the first and
-        last video PTS seen. Falls back to the target only when unmeasurable or
-        nonsensical (e.g. a timeline jump)."""
-        if self._seg_first_pts is None or self._seg_last_pts is None:
+    def _measured_span(self, end_pts=None):
+        """Best measured duration of the segment being closed, from its first
+        video PTS to ``end_pts`` (defaulting to the most recent in-segment PTS).
+        Falls back to the target only when unmeasurable or nonsensical (e.g. a
+        timeline jump left nothing measurable)."""
+        end = end_pts if end_pts is not None else self._seg_last_pts
+        if self._seg_first_pts is None or end is None:
             return self.target_duration
-        d = self._elapsed(self._seg_last_pts, self._seg_first_pts)
+        d = self._elapsed(end, self._seg_first_pts)
         if d <= 0 or d > 4 * self.target_duration:
             return self.target_duration
         return d
+
+    def _maybe_emit_part(self, events, pts):
+        """Close the open part if it has reached part_target at this PES
+        boundary. The part is the bytes accumulated since the previous boundary
+        and does NOT include the triggering packet (which opens the next part).
+        A frame whose PTS is below the part start (B-frame reordering) yields a
+        negative delta and is simply skipped until a later frame advances time."""
+        if self.part_target <= 0 or pts is None or self._part_start_pts is None:
+            return
+        elapsed = self._elapsed(pts, self._part_start_pts)
+        if elapsed < self.part_target:
+            return
+        data = bytes(self._current[self._part_offset:])
+        if not data:
+            return
+        events.append(Part(data, self._clamp_part(elapsed),
+                           independent=(self._part_index == 0)))
+        self._part_offset = len(self._current)
+        self._part_start_pts = pts
+        self._part_index += 1
+
+    def _emit_final_part(self, events, end_pts):
+        """Flush the in-progress segment's trailing bytes as its last part when
+        the segment is cut, so a segment's parts tile the whole segment."""
+        if self.part_target <= 0:
+            return
+        data = bytes(self._current[self._part_offset:])
+        if not data:
+            return
+        duration = self.part_target
+        if end_pts is not None and self._part_start_pts is not None:
+            d = self._elapsed(end_pts, self._part_start_pts)
+            # Guard against a discontinuity/timeline jump or B-frame reorder
+            # producing a nonsense value; a legitimate final part is at most
+            # ~part_target long.
+            if 0 < d <= 2 * self.part_target:
+                duration = d
+        events.append(Part(data, self._clamp_part(duration),
+                           independent=(self._part_index == 0)))
+
+    def _clamp_part(self, duration):
+        """Cap a part duration at the advertised PART-TARGET ceiling so no
+        EXT-X-PART DURATION can exceed the frozen PART-TARGET the manager
+        advertises (RFC 8216bis 4.4.4.9). A no-op for the realistic case where
+        parts land at ~part_target; only a pathological over-ceiling tail is
+        pinned down."""
+        if self._part_ceiling > 0 and duration > self._part_ceiling:
+            return self._part_ceiling
+        return duration
 
     def _begin_segment(self, pts):
         self._current = bytearray()
@@ -477,6 +619,11 @@ class TSSegmenter:
         self._collecting = True
         self._current_discontinuity = self._pending_discontinuity
         self._pending_discontinuity = False
+        # Part 0 begins here, at offset 0 so it carries the PAT+PMT and the
+        # keyframe (making it the segment's INDEPENDENT part).
+        self._part_offset = 0
+        self._part_start_pts = pts
+        self._part_index = 0
 
     def _finish_segment(self, duration):
         if duration <= 0 or duration > 4 * self.target_duration:
@@ -589,16 +736,52 @@ def window_sustains_playback(window, target_duration,
     return total >= needed
 
 
-def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_target=None):
+def _append_part_line(lines, part_name, seq, index, part):
+    """Append one #EXT-X-PART line. part is [duration, independent]."""
+    duration = part[0]
+    independent = len(part) > 1 and part[1]
+    uri = part_name.format(seq=seq, part=index)
+    line = f'#EXT-X-PART:DURATION={duration:.5f},URI="{uri}"'
+    if independent:
+        line += ",INDEPENDENT=YES"
+    lines.append(line)
+
+
+# How many completed segments carry EXT-X-PART lines, matching the manager's
+# PARTS_RETAINED_SEGMENTS and Apple's ~3-target-duration LL authoring guidance,
+# so a post-stall rejoin lands on a fine-grained edge.
+PARTS_RENDERED_SEGMENTS = 3
+
+
+def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_target=None,
+                          part_target=0.0, parts_by_seq=None, building=None,
+                          part_name="p{seq}.{part}.ts"):
     """
-    Render an HLS media playlist (RFC 8216, version 3) from a window of
-    segment descriptors: [{"seq": int, "dur": float, "disc": bool}, ...].
-    Segment URIs are relative so they resolve against the playlist URL.
+    Render an HLS media playlist from a window of segment descriptors:
+    [{"seq": int, "dur": float, "disc": bool, "pdt": str}, ...]. Segment URIs
+    are relative so they resolve against the playlist URL.
+
+    Default output is RFC 8216 version 3. When ``part_target > 0`` the output is
+    a Low-Latency HLS playlist (version 10) that additionally carries
+    #EXT-X-SERVER-CONTROL (CAN-BLOCK-RELOAD), #EXT-X-PART-INF, #EXT-X-PART lines
+    for the most recent segments and the in-progress segment, and an
+    #EXT-X-PRELOAD-HINT for the next part. ``parts_by_seq`` maps a completed
+    segment's seq (str) to its list of [duration, independent] parts;
+    ``building`` is {"seq": int, "parts": [[duration, independent], ...],
+    "disc": bool} for the segment currently being produced.
 
     ``adv_target`` is the manager's frozen EXT-X-TARGETDURATION; when supplied it
     is emitted verbatim so the value never changes across reloads (RFC 8216
     6.2.1). Without it (legacy descriptor) the per-window ceil is used.
+    ``part_target`` is frozen the same way and likewise emitted verbatim, since
+    rfc8216bis 6.2.1's permitted-change list excludes EXT-X-PART-INF and
+    EXT-X-SERVER-CONTROL.
     """
+    ll = bool(part_target and part_target > 0)
+    parts_by_seq = parts_by_seq or {}
+    building = building or {}
+    building_parts = building.get("parts") or []
+    building_seq = building.get("seq")
     # Frozen live-edge offset: ~2.5 config target-durations (~10s at the 4s
     # default) so the value is a session constant and never drifts across
     # reloads as the window slides (unlike a window-max derivation).
@@ -627,25 +810,73 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_
     # declaring for the seek behaviour it buys on every normal segment.
     lines = [
         "#EXTM3U",
-        "#EXT-X-VERSION:3",
+        f"#EXT-X-VERSION:{10 if ll else 3}",
         "#EXT-X-INDEPENDENT-SEGMENTS",
         f"#EXT-X-TARGETDURATION:{advertised_target}",
         f"#EXT-X-MEDIA-SEQUENCE:{window[0]['seq']}",
     ]
-    # EXT-X-START is emitted from the FIRST playlist onward. Its value is a
-    # session constant (2.5 config target-durations), so it is stable across
-    # reloads either way (RFC 8216 6.2.1) - but withholding it until the
-    # window is deep enough removed the join hint from precisely the
-    # cold-start reloads that need it, and made the tag set itself change
-    # mid-session. A window shorter than the offset simply clamps the join
-    # to the start of the window, which is what a player without the tag
-    # already does, so nothing regresses on a thin window. It pins the join
-    # point deterministically across players; a client that sets its own
-    # offset still overrides it.
-    lines.append(f"#EXT-X-START:TIME-OFFSET=-{start_offset:.3f},PRECISE=YES")
+
+    # Only the most recent segments carry EXT-X-PART lines; older ones are
+    # whole-segment only, which is all a client that far behind the edge needs.
+    part_seqs = (
+        {entry["seq"] for entry in window[-PARTS_RENDERED_SEGMENTS:]} if ll else set()
+    )
+
+    if ll:
+        # PART-TARGET and PART-HOLD-BACK are stream-lifetime constants:
+        # rfc8216bis 6.2.1's permitted-change list excludes EXT-X-PART-INF and
+        # EXT-X-SERVER-CONTROL, and every Partial Segment MUST be <= PART-TARGET
+        # (4.4.4.9) with non-final parts >= 85% of it. The manager freezes
+        # PART-TARGET (configured part_target * 1.12, which keeps every real
+        # >=24fps part inside the 85% band while covering observed jitter) and
+        # passes it here; PART-HOLD-BACK is exactly 3x. Nothing is recomputed.
+        hold_back = round(3 * part_target, 3)
+        lines.append(
+            f"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={hold_back:.3f}"
+        )
+        lines.append(f"#EXT-X-PART-INF:PART-TARGET={part_target:.3f}")
+        # Deliberately NO EXT-X-START in LL: PART-HOLD-BACK is rfc8216bis's
+        # native live-edge positioning and takes precedence over EXT-X-START, so
+        # emitting both would only pin latency further back than the parts allow.
+    else:
+        # EXT-X-START is emitted from the FIRST playlist onward. Its value is a
+        # session constant (2.5 config target-durations), so it is stable across
+        # reloads either way (RFC 8216 6.2.1) - but withholding it until the
+        # window is deep enough removed the join hint from precisely the
+        # cold-start reloads that need it, and made the tag set itself change
+        # mid-session. A window shorter than the offset simply clamps the join
+        # to the start of the window, which is what a player without the tag
+        # already does, so nothing regresses on a thin window. It pins the join
+        # point deterministically across players; a client that sets its own
+        # offset still overrides it.
+        lines.append(f"#EXT-X-START:TIME-OFFSET=-{start_offset:.3f},PRECISE=YES")
+
     for entry in window:
         if entry.get("disc"):
             lines.append("#EXT-X-DISCONTINUITY")
+        if entry.get("pdt"):
+            # PROGRAM-DATE-TIME anchors the segment on the wall clock: Apple's
+            # Low-Latency Server Configuration Profile (rfc8216bis Appendix B.1)
+            # requires it in every LL media playlist for latency management, and
+            # it drives AVPlayer's recommendedTimeOffsetFromLive.
+            lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{entry['pdt']}")
+        if entry["seq"] in part_seqs:
+            for i, part in enumerate(parts_by_seq.get(str(entry["seq"]), [])):
+                _append_part_line(lines, part_name, entry["seq"], i, part)
         lines.append(f"#EXTINF:{entry['dur']:.3f},")
         lines.append(segment_name.format(seq=entry["seq"]))
+
+    # In-progress segment: its parts (no EXTINF yet) followed by a preload hint
+    # for the next part, which the client fetches with a blocking GET.
+    if ll and building_parts and building_seq is not None:
+        if building.get("disc"):
+            # Signal the discontinuity from the first render that carries any of
+            # this segment's parts, so the tag is never inserted retroactively
+            # before already-published EXT-X-PART lines (rfc8216bis 6.2.1).
+            lines.append("#EXT-X-DISCONTINUITY")
+        for i, part in enumerate(building_parts):
+            _append_part_line(lines, part_name, building_seq, i, part)
+        next_uri = part_name.format(seq=building_seq, part=len(building_parts))
+        lines.append(f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI="{next_uri}"')
+
     return "\n".join(lines) + "\n"

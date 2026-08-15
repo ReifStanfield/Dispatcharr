@@ -8,6 +8,8 @@ Django/Redis), so they run standalone:
 import unittest
 
 from .segmenter import (
+    Part,
+    Segment,
     TSSegmenter,
     TS_PACKET_SIZE,
     extract_pts,
@@ -316,9 +318,7 @@ class SegmenterTests(unittest.TestCase):
     def test_discontinuity_flag_propagates(self):
         seg = self.make_started(target=2.0)
         finished = feed_stream(seg, gop_seconds=2.0, gop_count=2)
-        tail = seg.flag_discontinuity()
-        if tail is not None:
-            finished.append(tail)
+        finished += seg.flag_discontinuity()
         # Timeline jumps far ahead, as after a provider failover
         finished += feed_stream(seg, gop_seconds=2.0, gop_count=3, start_pts=9000.0)
         flagged = [s for s in finished if s.discontinuity]
@@ -333,10 +333,11 @@ class SegmenterTests(unittest.TestCase):
         pre_gap_len = len(seg._current)
         self.assertTrue(seg._collecting)
 
-        tail = seg.flag_discontinuity()
+        events = seg.flag_discontinuity()
         # The open segment is finished immediately from pre-gap bytes only,
         # with its measured span, and is NOT the discontinuity-tagged one.
-        self.assertIsNotNone(tail)
+        self.assertEqual(len(events), 1)
+        tail = events[0]
         self.assertEqual(len(tail.data), pre_gap_len)
         self.assertAlmostEqual(tail.duration, 1.5, places=3)
         self.assertFalse(tail.discontinuity)
@@ -357,8 +358,7 @@ class SegmenterTests(unittest.TestCase):
         seg = self.make_started(target=4.0)
         # Only the opening keyframe collected: measured span is zero.
         seg.feed(make_video_pes(0.0, keyframe=True))
-        tail = seg.flag_discontinuity()
-        self.assertIsNone(tail)
+        self.assertEqual(seg.flag_discontinuity(), [])
         self.assertFalse(seg._collecting)
         # The tag still lands on the next started segment.
         seg.feed(make_video_pes(100.0, keyframe=True))
@@ -588,6 +588,252 @@ class ClientStalenessTests(unittest.TestCase):
         # never as stale.
         now = 1000.0
         self.assertFalse(client_is_stale(str(now + 60), now, 15))
+
+
+class PartTests(unittest.TestCase):
+    """Low-Latency HLS partial segments."""
+
+    def make_ll(self, target=4.0, part_target=0.5, **kwargs):
+        # startup_cuts=0 / no ramp keeps these on steady-state cut behavior;
+        # the fast-start ladder has its own dedicated tests.
+        seg = TSSegmenter(target_duration=target, part_target=part_target,
+                          startup_keyframe_cuts=0, startup_ramp_fractions=(),
+                          **kwargs)
+        seg.feed(make_pat())
+        seg.feed(make_pmt())
+        return seg
+
+    def _feed(self, seg, frames):
+        events = []
+        for pts, keyframe in frames:
+            events.extend(seg.feed(make_video_pes(pts, keyframe=keyframe)))
+        return events
+
+    def test_parts_tile_the_segment(self):
+        seg = self.make_ll()
+        frames = [(0.0, True)]
+        t = 0.25
+        while t < 4.0:
+            frames.append((round(t, 2), False))
+            t += 0.25
+        frames.append((4.0, True))  # keyframe at/after target cuts the segment
+        events = self._feed(seg, frames)
+
+        parts = [e for e in events if isinstance(e, Part)]
+        segments = [e for e in events if isinstance(e, Segment)]
+        self.assertEqual(len(segments), 1)
+        # ~8 parts of ~0.5s span the 4s segment (including the final tail part).
+        self.assertGreaterEqual(len(parts), 6)
+        # Only the first part carries the keyframe + PAT/PMT.
+        self.assertTrue(parts[0].independent)
+        self.assertFalse(parts[1].independent)
+        # A segment's parts concatenate exactly to the segment bytes.
+        self.assertEqual(b"".join(p.data for p in parts), segments[0].data)
+        for p in parts:
+            self.assertLessEqual(p.duration, 2 * 0.5)  # bounded near part_target
+
+    def test_part_target_zero_emits_only_segments(self):
+        seg = self.make_ll(part_target=0.0)
+        frames = [(0.0, True), (2.0, False), (4.0, True)]
+        events = self._feed(seg, frames)
+        self.assertTrue(all(isinstance(e, Segment) for e in events))
+        self.assertEqual(len(events), 1)
+
+    def test_bframe_reorder_gives_no_garbage_durations(self):
+        # Decode-order PTS that dips below the previous frame like B-frame
+        # reordering. A naive pts-start delta goes slightly negative and, if
+        # treated as a 33-bit wrap, yields a ~95443s garbage part duration that
+        # makes AVPlayer reject the playlist. Durations must stay sane.
+        seg = self.make_ll()
+        frames = [(0.0, True)]
+        base = 0.0
+        while base < 4.0:
+            base += 0.25
+            frames.append((round(base + 0.1, 3), False))  # ahead in presentation
+            frames.append((round(base, 3), False))        # dips back (B-frame)
+        frames.append((4.2, True))  # keyframe cuts the segment
+        events = self._feed(seg, frames)
+        parts = [e for e in events if isinstance(e, Part)]
+        self.assertTrue(parts)
+        for p in parts:
+            self.assertGreater(p.duration, 0)
+            self.assertLess(p.duration, seg.target_duration)  # never ~95443s
+
+    def test_part_ceiling_clamps_over_target_tail(self):
+        # A coarse frame cadence makes a tail longer than the advertised ceiling;
+        # every emitted part duration must still be <= the ceiling so no
+        # EXT-X-PART exceeds the frozen PART-TARGET (RFC 8216bis 4.4.4.9).
+        ceiling = 0.56
+        seg = self.make_ll(part_ceiling=ceiling)
+        # ~1.5fps: PES boundaries 0.7s apart, so a raw tail would reach ~0.7s.
+        frames = [(0.0, True), (0.7, False), (1.4, False), (2.1, False),
+                  (2.8, False), (3.5, False), (4.2, True)]
+        events = self._feed(seg, frames)
+        parts = [e for e in events if isinstance(e, Part)]
+        self.assertTrue(parts)
+        for p in parts:
+            self.assertLessEqual(p.duration, ceiling + 1e-9)
+
+    def test_non_final_parts_land_in_85_percent_band(self):
+        # At a realistic frame cadence the frozen adv_part (part_target * 1.12)
+        # keeps every non-final part inside [0.85*adv_part, adv_part]
+        # (RFC 8216bis 4.4.4.9), the last part of each segment exempt.
+        part_target = 0.5
+        adv_part = round(part_target * 1.12, 3)   # 0.56, as the manager freezes
+        seg = self.make_ll(part_target=part_target, part_ceiling=adv_part)
+        frames = [(0.0, True)]
+        i = 1
+        while i / 30.0 < 8.0:                     # 30fps, two 4s segments
+            t = round(i / 30.0, 5)
+            kf = abs(t - 4.0) < 1e-6              # a keyframe at the 4s target
+            frames.append((t, kf))
+            i += 1
+        events = self._feed(seg, frames)
+        # Split parts by the Segment they precede; the last part before each
+        # Segment is that segment's final (exempt) part.
+        groups, cur = [], []
+        for e in events:
+            if isinstance(e, Part):
+                cur.append(e)
+            elif isinstance(e, Segment):
+                groups.append(cur)
+                cur = []
+        self.assertTrue(any(len(g) >= 2 for g in groups))
+        for g in groups:
+            for p in g[:-1]:                      # non-final parts
+                self.assertLessEqual(p.duration, adv_part)
+                self.assertGreaterEqual(p.duration, 0.85 * adv_part)
+            if g:
+                self.assertLessEqual(g[-1].duration, adv_part)  # final part
+
+    def test_discontinuity_flushes_final_part_before_segment(self):
+        # A hard cut at a discontinuity must still tile the closing segment:
+        # its trailing bytes flush as a final Part, ordered before the Segment.
+        seg = self.make_ll()
+        seg.feed(make_video_pes(0.0, keyframe=True))
+        for t in (0.25, 0.5, 0.75, 1.0, 1.25):
+            seg.feed(make_video_pes(t, keyframe=False))
+        events = seg.flag_discontinuity()
+        self.assertTrue(events)
+        self.assertIsInstance(events[-1], Segment)
+        parts = [e for e in events if isinstance(e, Part)]
+        self.assertTrue(parts)
+        # Parts emitted during the segment plus this tail cover the whole segment.
+        self.assertFalse(events[-1].discontinuity)  # the NEXT segment carries it
+
+    def test_parts_suppressed_until_keyframe_reanchors_after_discontinuity(self):
+        # Post-gap bytes before a keyframe must not be emitted as parts against
+        # the pre-jump part start, which would advertise a garbage duration.
+        seg = self.make_ll()
+        seg.feed(make_video_pes(0.0, keyframe=True))
+        seg.feed(make_video_pes(0.6, keyframe=False))
+        seg.flag_discontinuity()
+        events = seg.feed(make_video_pes(9000.6, keyframe=False))
+        self.assertEqual(events, [])
+
+
+class LowLatencyPlaylistTests(unittest.TestCase):
+    def test_render_low_latency(self):
+        window = [
+            {"seq": 5, "dur": 4.0, "disc": False},
+            {"seq": 6, "dur": 4.1, "disc": False},
+        ]
+        parts_by_seq = {"6": [[0.5, True], [0.5, False]]}
+        building = {"seq": 7, "parts": [[0.5, True], [0.4, False]]}
+        # part_target here is the FROZEN advertised PART-TARGET (adv_part), which
+        # the manager computes and carries in the descriptor; render emits it and
+        # PART-HOLD-BACK = 3x it verbatim, recomputing neither.
+        text = render_media_playlist(
+            window, 4, part_target=0.56, parts_by_seq=parts_by_seq,
+            building=building, adv_target=8,
+        )
+        self.assertIn("#EXT-X-VERSION:10", text)
+        self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)
+        self.assertIn("#EXT-X-TARGETDURATION:8", text)  # frozen, not ceil(4.1)=5
+        self.assertIn(
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.680", text)
+        self.assertIn("#EXT-X-PART-INF:PART-TARGET=0.560", text)
+        # LL never carries EXT-X-START: PART-HOLD-BACK positions the client.
+        self.assertNotIn("#EXT-X-START", text)
+        # Parts of the last completed segment, with the first marked independent.
+        self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p6.0.ts",INDEPENDENT=YES', text)
+        self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p6.1.ts"', text)
+        # In-progress segment's parts + a preload hint for the next part.
+        self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p7.0.ts",INDEPENDENT=YES', text)
+        self.assertIn('#EXT-X-PRELOAD-HINT:TYPE=PART,URI="p7.2.ts"', text)
+        # The completed segments are still present for non-LL clients.
+        self.assertIn("6.ts", text)
+        # Same call without part_target stays a plain version-3 playlist that
+        # keeps this branch's EXT-X-START join hint.
+        plain = render_media_playlist(window, 4)
+        self.assertIn("#EXT-X-VERSION:3", plain)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-", plain)
+        self.assertNotIn("#EXT-X-PART", plain)
+
+    def test_part_target_and_holdback_constant(self):
+        # PART-TARGET / PART-HOLD-BACK are frozen constants: render must emit the
+        # passed adv_part verbatim regardless of the listed part maxima (0.501 vs
+        # 0.534), so AVPlayer's blocking-reload timing model never sees them flap.
+        w = [{"seq": 6, "dur": 4.1}]
+        t1 = render_media_playlist(
+            w, 4, part_target=0.56, parts_by_seq={"6": [[0.501, True]]},
+            building={"seq": 7, "parts": [[0.501, True]]}, adv_target=8)
+        t2 = render_media_playlist(
+            w, 4, part_target=0.56, parts_by_seq={"6": [[0.534, True]]},
+            building={"seq": 7, "parts": [[0.534, True]]}, adv_target=8)
+        for text in (t1, t2):
+            self.assertIn("#EXT-X-PART-INF:PART-TARGET=0.560", text)
+            self.assertIn("PART-HOLD-BACK=1.680", text)
+
+    def test_ll_program_date_time_and_building_discontinuity(self):
+        # Apple's LL profile requires EXT-X-PROGRAM-DATE-TIME per segment; the
+        # building segment's discontinuity must be signalled before its first
+        # part (never inserted retroactively).
+        window = [
+            {"seq": 5, "dur": 4.0, "disc": False, "pdt": "2026-07-01T00:00:00.000+00:00"},
+            {"seq": 6, "dur": 4.1, "disc": True, "pdt": "2026-07-01T00:00:04.000+00:00"},
+        ]
+        building = {"seq": 7, "parts": [[0.5, True]], "disc": True}
+        text = render_media_playlist(
+            window, 4, part_target=0.56,
+            parts_by_seq={"6": [[0.5, True]]}, building=building, adv_target=8)
+        lines = text.splitlines()
+        # Segment 5 has no listed parts, so its PDT sits immediately before EXTINF.
+        pdt5 = lines.index("#EXT-X-PROGRAM-DATE-TIME:2026-07-01T00:00:00.000+00:00")
+        self.assertEqual(lines[pdt5 + 1], "#EXTINF:4.000,")
+        # Segment 6's PDT precedes its EXTINF (parts intervene) and follows the
+        # discontinuity tag for that segment.
+        pdt6 = lines.index("#EXT-X-PROGRAM-DATE-TIME:2026-07-01T00:00:04.000+00:00")
+        extinf6 = lines.index("#EXTINF:4.100,")
+        self.assertLess(pdt6, extinf6)
+        disc_positions = [i for i, l in enumerate(lines) if l == "#EXT-X-DISCONTINUITY"]
+        self.assertTrue(any(i < pdt6 for i in disc_positions))
+        # Building discontinuity precedes the building segment's first part line.
+        first_building_part = lines.index(
+            '#EXT-X-PART:DURATION=0.50000,URI="p7.0.ts",INDEPENDENT=YES')
+        self.assertTrue(any(i < first_building_part for i in disc_positions))
+
+    def test_only_recent_segments_carry_part_lines(self):
+        # Parts are rendered for the last PARTS_RENDERED_SEGMENTS only; older
+        # segments stay whole-segment, which is all a client that far behind
+        # the live edge needs.
+        window = [{"seq": s, "dur": 4.0} for s in range(1, 7)]
+        parts_by_seq = {str(s): [[0.5, True]] for s in range(1, 7)}
+        text = render_media_playlist(
+            window, 4, part_target=0.56, parts_by_seq=parts_by_seq, adv_target=8)
+        self.assertNotIn('URI="p1.0.ts"', text)
+        self.assertNotIn('URI="p3.0.ts"', text)
+        self.assertIn('URI="p4.0.ts"', text)
+        self.assertIn('URI="p6.0.ts"', text)
+
+
+class VideoCodecTests(unittest.TestCase):
+    def test_video_codec_learned_from_pmt(self):
+        seg = TSSegmenter(target_duration=4.0)
+        self.assertIsNone(seg.video_codec)
+        seg.feed(make_pat())
+        seg.feed(make_pmt())
+        self.assertEqual(seg.video_codec, "h264")
 
 
 if __name__ == "__main__":

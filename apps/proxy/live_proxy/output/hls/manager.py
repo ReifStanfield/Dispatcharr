@@ -14,10 +14,11 @@ output:{fmt}:owner lock, exactly like the fMP4 remux manager.
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 from core.utils import RedisClient
 from ..fmp4.buffer import FMP4StreamBuffer
-from .segmenter import TSSegmenter, client_is_stale, client_stale_after
+from .segmenter import Part, TSSegmenter, client_is_stale, client_stale_after
 from ...redis_keys import RedisKeys
 from ...config_helper import ConfigHelper
 from ...utils import get_logger
@@ -75,6 +76,21 @@ TARGET_ROUNDING_SLACK = 0.35
 DEMAND_CHECK_INTERVAL = 5
 DEMAND_GRACE_CHECKS = 2
 
+# Low-Latency HLS partial-segment target (seconds). 0 disables LL-HLS
+# (segments only). ~0.5s parts put the live edge within ~1.5s (PART-HOLD-BACK
+# = 3 x PART-TARGET) for players that support Blocking Playlist Reload, while
+# non-LL players ignore the part tags and use the whole segments unchanged.
+DEFAULT_PART_TARGET = 0.5
+# A part must stay fetchable while it is advertised (up to ~3 segments back)
+# AND long enough for a blocking request already in flight to be answered. Sized
+# generously: it costs only Redis memory, while too short a TTL expires an
+# advertised part and 404s a client that asks for it.
+PART_KEY_TTL = 60
+# How many recent segments keep their parts in the descriptor and get their
+# EXT-X-PART lines rendered. Matches Apple's ~3-target-durations guidance and
+# the renderer's PARTS_RENDERED_SEGMENTS.
+PARTS_RETAINED_SEGMENTS = 3
+
 
 class HLSOutputManager:
     """
@@ -107,6 +123,21 @@ class HLSOutputManager:
         # past the advertised target by the rounding slack; beyond that it
         # would round up and contradict the frozen value.
         self.max_segment_duration = self.adv_target + TARGET_ROUNDING_SLACK
+        # LL-HLS emit threshold, and the FROZEN advertised PART-TARGET derived
+        # from it. adv_part sits just above the emit threshold so every part is
+        # <= it while non-final parts stay >= 85% of it (RFC 8216bis 4.4.4.9);
+        # like TARGETDURATION it is a stream-lifetime constant, since
+        # rfc8216bis 6.2.1's permitted-change list excludes EXT-X-PART-INF and
+        # EXT-X-SERVER-CONTROL.
+        # Coerced: an unparseable value here would otherwise raise inside the
+        # segmenter thread and take the whole manager down silently, where
+        # falling back to the default just means "no LL" at worst.
+        try:
+            self.part_target = float(
+                ConfigHelper.get('HLS_PART_TARGET', DEFAULT_PART_TARGET))
+        except (TypeError, ValueError):
+            self.part_target = DEFAULT_PART_TARGET
+        self.adv_part = round(self.part_target * 1.12, 3) if self.part_target > 0 else 0.0
 
         # Same Redis-backed chunk store the fMP4 manager uses; it is
         # format-parameterized by design ("adding a new output format only
@@ -133,6 +164,17 @@ class HLSOutputManager:
         # segmenter has parsed it; surfaced in the playlist descriptor so the
         # playlist view can refuse formats a client cannot decode (HEVC-in-TS).
         self._video_codec = None
+        # Low-Latency HLS part state. _building_seq is the media sequence the
+        # in-progress segment will take when it closes (put_fragment INCRs, so
+        # it is the current index + 1); _building_parts accumulates
+        # [dur, independent] for that segment; _parts_by_seq keeps a small tail
+        # of completed segments' parts for the descriptor. _building_disc is
+        # refreshed from the segmenter each loop iteration so building["disc"]
+        # is truthful from the first published part.
+        self._building_seq = None
+        self._building_parts = []
+        self._building_disc = False
+        self._parts_by_seq = {}
         # Seed the rolling window + frozen target from an existing descriptor so
         # a mid-session worker restart/takeover does not clobber the playlist to
         # a fresh window (MEDIA-SEQUENCE must never regress; RFC 8216 6.2.2). The
@@ -153,6 +195,10 @@ class HLSOutputManager:
                         self.max_segment_duration = (
                             self.adv_target + TARGET_ROUNDING_SLACK
                         )
+                    if prior.get("part_target"):
+                        # Inherit the frozen PART-TARGET for the same reason:
+                        # a takeover must not re-advertise a different one.
+                        self.adv_part = prior["part_target"]
             except Exception:
                 pass
 
@@ -213,6 +259,10 @@ class HLSOutputManager:
         segmenter = TSSegmenter(
             target_duration=self.segment_duration,
             max_segment_duration=self.max_segment_duration,
+            part_target=self.part_target,
+            # Clamp emitted parts to exactly the advertised PART-TARGET so no
+            # EXT-X-PART DURATION can exceed the frozen constant.
+            part_ceiling=self.adv_part,
         )
 
         # Start behind live so the first segments cover the same window a
@@ -237,9 +287,7 @@ class HLSOutputManager:
                     # Hard cut: close the open segment from pre-switch bytes
                     # only; the next segment starts at a post-switch keyframe
                     # and carries the discontinuity tag.
-                    tail = segmenter.flag_discontinuity()
-                    if tail is not None:
-                        self._store_segment(tail)
+                    self._store_discontinuity_tail(segmenter.flag_discontinuity())
                     logger.info(
                         f"[HLS:{self.channel_id}] Input stream switched; segment "
                         f"cut, next segment will be marked as a discontinuity"
@@ -278,8 +326,24 @@ class HLSOutputManager:
                     for chunk in chunks:
                         if not self.running:
                             break
-                        for segment in segmenter.feed(chunk):
+                        events = segmenter.feed(chunk)
+                        for i, event in enumerate(events):
                             self._video_codec = segmenter.video_codec
+                            self._building_disc = segmenter.current_discontinuity
+                            if isinstance(event, Part):
+                                # Suppress the descriptor publish for a final
+                                # part immediately followed by its Segment (the
+                                # segment publish supersedes it microseconds
+                                # later), so the transient state never
+                                # advertises a PRELOAD-HINT for a part of a
+                                # segment that is closing.
+                                publish = not (
+                                    i + 1 < len(events)
+                                    and not isinstance(events[i + 1], Part)
+                                )
+                                self._store_part(event, publish=publish)
+                                continue
+                            segment = event
                             self._store_segment(segment)
                             if not first_segment_stored:
                                 first_segment_stored = True
@@ -295,9 +359,7 @@ class HLSOutputManager:
                         # open segment is hard-cut so pre-gap and post-gap
                         # data never share a segment.
                         local_index = self.ts_buffer.index - 5
-                        tail = segmenter.flag_discontinuity()
-                        if tail is not None:
-                            self._store_segment(tail)
+                        self._store_discontinuity_tail(segmenter.flag_discontinuity())
                         logger.debug(
                             f"[HLS:{self.channel_id}] Skipped forward to index {local_index}"
                         )
@@ -308,34 +370,95 @@ class HLSOutputManager:
         finally:
             logger.debug(f"[HLS:{self.channel_id}] Segmenter loop exited")
 
+    def _store_discontinuity_tail(self, events):
+        """Store whatever flag_discontinuity closed out: in LL mode the closing
+        segment's final Part followed by the Segment itself, otherwise just the
+        Segment. Empty when the open segment held nothing playable."""
+        for event in events:
+            if isinstance(event, Part):
+                # Do not publish on this part: the Segment right behind it
+                # supersedes the descriptor microseconds later.
+                self._store_part(event, publish=False)
+            else:
+                self._store_segment(event)
+
+    def _store_part(self, part, publish=True):
+        """Store one Low-Latency HLS partial segment for the in-progress segment
+        and refresh the descriptor so the live edge advances every ~part_target.
+        ``publish=False`` stores the bytes but skips the descriptor refresh (used
+        for a final part whose closing Segment publishes right after)."""
+        if self.part_target <= 0:
+            return
+        if self._building_seq is None:
+            # The in-progress segment takes the next media sequence number
+            # (put_fragment INCRs the index when it is eventually stored).
+            self._building_seq = self.segment_buffer.index + 1
+        part_index = len(self._building_parts)
+        # Store parts in the same buffer Redis as the segment chunks so the part
+        # view reads them exactly like hls_segment reads chunks. A missing buffer
+        # or a failed write must NOT append to _building_parts: the descriptor
+        # would then advertise a part whose bytes were never stored, and every
+        # request for that URI would 404 after a blocking hold.
+        buf = self.segment_buffer.redis_client
+        if not buf:
+            return
+        try:
+            buf.setex(
+                RedisKeys.output_part(
+                    self.channel_id, self.fmt, self._building_seq, part_index
+                ),
+                PART_KEY_TTL,
+                part.data,
+            )
+        except Exception as e:
+            logger.error(f"[HLS:{self.channel_id}] Error storing part: {e}")
+            return
+        self._building_parts.append([round(part.duration, 5), bool(part.independent)])
+        # Publish only once a full segment anchors the window: a descriptor with
+        # an empty window renders a degenerate zero-segment playlist AVPlayer
+        # will not start on (the cold-start black screen). The bytes are still
+        # stored above, ready the moment the first segment closes.
+        if publish and self._window:
+            self._publish_playlist_state()
+
     def _store_segment(self, segment):
         """Store one finished segment and refresh the playlist descriptor."""
         if not self.segment_buffer.put_fragment(segment.data):
+            # Redis write failed: drop the in-progress LL state so the next part
+            # re-derives its seq from Redis rather than accumulating two
+            # segments' parts under a stale seq (which would 404 every
+            # advertised part).
+            self._building_parts = []
+            self._building_seq = None
+            self._building_disc = False
             return
         seq = self.segment_buffer.index
+        # Wall-clock anchor for the segment START (Apple's Low-Latency profile
+        # requires EXT-X-PROGRAM-DATE-TIME on all media playlists; it also
+        # drives AVPlayer's recommendedTimeOffsetFromLive).
+        seg_start = datetime.now(timezone.utc) - timedelta(seconds=segment.duration)
         self._window.append({
             "seq": seq,
             "dur": round(segment.duration, 3),
             "disc": bool(segment.discontinuity),
+            "pdt": seg_start.isoformat(timespec="milliseconds"),
         })
         if len(self._window) > self.window_size:
             self._window = self._window[-self.window_size:]
 
-        if self._redis:
-            try:
-                playlist_state = {
-                    "window": self._window,
-                    "target": self.segment_duration,
-                    "adv_target": self.adv_target,
-                    "vcodec": self._video_codec,
-                }
-                self._redis.setex(
-                    RedisKeys.output_playlist(self.channel_id, self.fmt),
-                    HLS_KEY_TTL,
-                    json.dumps(playlist_state),
-                )
-            except Exception as e:
-                logger.error(f"[HLS:{self.channel_id}] Error updating playlist state: {e}")
+        # The parts accumulated while building now belong to this completed
+        # segment (its seq equals the seq tracked during building). Hand them
+        # over, start a fresh in-progress segment, and prune old parts.
+        if self.part_target > 0:
+            self._parts_by_seq[str(seq)] = self._building_parts
+            self._building_parts = []
+            self._building_seq = self.segment_buffer.index + 1
+            keep = {str(e["seq"]) for e in self._window[-PARTS_RETAINED_SEGMENTS:]}
+            self._parts_by_seq = {
+                k: v for k, v in self._parts_by_seq.items() if k in keep
+            }
+
+        self._publish_playlist_state()
 
         # Heartbeat the owner lock and state key (both set once with ex=3600 and
         # otherwise never refreshed): a stream longer than an hour would silently
@@ -349,6 +472,37 @@ class HLSOutputManager:
             f"{segment.duration:.2f}s, {len(segment.data)} bytes"
             f"{' [discontinuity]' if segment.discontinuity else ''}"
         )
+
+    def _publish_playlist_state(self):
+        """Write the rolling playlist descriptor to Redis for the playlist view
+        to render on demand. Includes LL-HLS part data when enabled."""
+        if not self._redis:
+            return
+        try:
+            playlist_state = {
+                "window": self._window,
+                "target": self.segment_duration,
+                "adv_target": self.adv_target,
+                "vcodec": self._video_codec,
+            }
+            if self.part_target > 0:
+                # Carries the FROZEN advertised PART-TARGET (adv_part), not the
+                # raw emit threshold, so PART-TARGET and PART-HOLD-BACK are
+                # constant across reloads (rfc8216bis 6.2.1).
+                playlist_state["part_target"] = self.adv_part
+                playlist_state["parts"] = self._parts_by_seq
+                playlist_state["building"] = {
+                    "seq": self._building_seq,
+                    "parts": self._building_parts,
+                    "disc": self._building_disc,
+                }
+            self._redis.setex(
+                RedisKeys.output_playlist(self.channel_id, self.fmt),
+                HLS_KEY_TTL,
+                json.dumps(playlist_state),
+            )
+        except Exception as e:
+            logger.error(f"[HLS:{self.channel_id}] Error updating playlist state: {e}")
 
     # ------------------------------------------------------------------
     # Demand accounting (pull-based clients)

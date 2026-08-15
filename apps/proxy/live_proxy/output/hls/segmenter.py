@@ -262,6 +262,14 @@ class TSSegmenter:
     def video_detected(self):
         return self._video_pid is not None
 
+    @property
+    def video_codec(self):
+        """Detected video codec family name (e.g. "h264", "h265"), or None
+        until the PMT has been parsed. Used to advertise the codec to
+        clients and to gate formats that a given HLS client cannot decode
+        (notably HEVC-in-MPEG-TS, which AVFoundation refuses)."""
+        return VIDEO_STREAM_TYPES.get(self._video_stream_type)
+
     def flag_discontinuity(self):
         """Mark a stream discontinuity (provider failover, buffer skip-ahead).
 
@@ -599,6 +607,7 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_
         return (
             "#EXTM3U\n"
             "#EXT-X-VERSION:3\n"
+            "#EXT-X-INDEPENDENT-SEGMENTS\n"
             # Ceil to match the populated branch; a fractional target must never
             # round DOWN below a real EXTINF (RFC 8216 4.3.3.1).
             f"#EXT-X-TARGETDURATION:{adv_target if adv_target else int(max(target_duration, 1) + 0.999)}\n"
@@ -609,9 +618,17 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts", adv_
     # jitter, and AVPlayer latches the first value and stops advancing on a
     # contradiction. Legacy fallback keeps the ceil.
     advertised_target = adv_target if adv_target else int(max(entry["dur"] for entry in window) + 0.999)
+    # Every segment begins on a keyframe and is prefixed with PAT/PMT
+    # (_begin_segment), so each one decodes without reference to any other.
+    # Declaring it lets a client seek or switch to any segment directly rather
+    # than assuming it must decode from the window head. The one exception is
+    # the mid-GOP force cut under max_segment_duration, which only fires in a
+    # keyframe drought a healthy source never reaches; the tag stays worth
+    # declaring for the seek behaviour it buys on every normal segment.
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
         f"#EXT-X-TARGETDURATION:{advertised_target}",
         f"#EXT-X-MEDIA-SEQUENCE:{window[0]['seq']}",
     ]

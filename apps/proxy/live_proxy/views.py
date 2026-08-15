@@ -3,6 +3,7 @@ import time
 import random
 import re
 import pathlib
+from functools import wraps
 from django.db import close_old_connections
 from django.http import (
     StreamingHttpResponse,
@@ -1299,7 +1300,33 @@ def _hls_session_gone(channel_id, client_id):
     return False
 
 
-@api_view(["GET"])
+def _hls_cors(view):
+    """Attach permissive CORS headers to an HLS response and answer CORS
+    preflight, so browser HLS clients (hls.js / Safari MSE) can fetch the
+    playlist and every segment cross-origin. Native players (AVPlayer, VLC,
+    mpv, ffmpeg) do not enforce CORS, so this only unblocks the web use
+    case the output already advertises; it never restricts native access.
+    Applied to every response including errors/redirects, since a missing
+    Access-Control-Allow-Origin on a segment is a classic silent failure."""
+    @wraps(view)
+    def wrapper(request, *args, **kwargs):
+        if request.method == "OPTIONS":
+            response = HttpResponse(status=204)
+        else:
+            response = view(request, *args, **kwargs)
+        origin = request.META.get("HTTP_ORIGIN")
+        response["Access-Control-Allow-Origin"] = origin or "*"
+        if origin:
+            response["Vary"] = "Origin"
+        response["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        response["Access-Control-Allow-Headers"] = "*"
+        response["Access-Control-Max-Age"] = "86400"
+        return response
+    return wrapper
+
+
+@_hls_cors
+@api_view(["GET", "OPTIONS"])
 @permission_classes([AllowAny])
 def hls_playlist(request, channel_id, client_id):
     """Rolling live media playlist for one HLS client."""
@@ -1369,6 +1396,21 @@ def hls_playlist(request, channel_id, client_id):
             response["Retry-After"] = "2"
             return response
 
+        # HLS output carries TS segments with the source codec untouched. Only
+        # H.264 in MPEG-TS is broadly playable over HLS: AVFoundation (AVPlayer,
+        # Safari) refuses HEVC/H.265-in-TS outright, so serving it would
+        # black-screen those clients with no error. Refuse the HLS format for
+        # non-H.264 video with a clear status instead, so a client gets a clean
+        # signal and can fall back to the MPEG-TS or fMP4 output. HEVC over HLS
+        # needs fMP4/CMAF segments (future work).
+        vcodec = playlist_state.get("vcodec")
+        if vcodec and vcodec != "h264":
+            return JsonResponse(
+                {"error": f"HLS output supports H.264 video only; this channel is {vcodec}. "
+                          f"Use the MPEG-TS or fMP4 output format for this channel."},
+                status=415,
+            )
+
         try:
             body = render_media_playlist(
                 playlist_state.get("window", []),
@@ -1388,7 +1430,8 @@ def hls_playlist(request, channel_id, client_id):
         close_old_connections()
 
 
-@api_view(["GET"])
+@_hls_cors
+@api_view(["GET", "OPTIONS"])
 @permission_classes([AllowAny])
 def hls_segment(request, channel_id, client_id, seq):
     """One HLS media segment, fetched by media sequence number from Redis."""
@@ -1422,7 +1465,16 @@ def hls_segment(request, channel_id, client_id, seq):
             return JsonResponse({"error": "Segment expired"}, status=404)
 
         response = HttpResponse(data, content_type="video/mp2t")
-        response["Cache-Control"] = "no-cache"
+        # A finished segment is immutable: put_fragment completes before the seq
+        # is ever advertised, and media-sequence numbers are monotonic (never
+        # reused), so a given /<seq>.ts always maps to the same bytes. Mark it
+        # cacheable + immutable so browsers/hls.js and any CDN in front of
+        # Dispatcharr serve concurrent in-window re-requests from cache instead
+        # of revalidating. The 60s max-age comfortably spans the default ~50s
+        # live window then expires; a larger configured window only loses cache
+        # hits at its tail, never correctness. The playlist itself stays
+        # no-cache (it changes on every reload).
+        response["Cache-Control"] = "public, max-age=60, immutable"
         return response
     finally:
         # Settings lookup above hits the ORM; this endpoint is polled every

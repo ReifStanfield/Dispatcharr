@@ -129,6 +129,10 @@ class HLSOutputManager:
             pass
         self._redis = RedisClient.get_client()
         self._window = []
+        # Video codec family ("h264"/"h265"/...) learned from the PMT once the
+        # segmenter has parsed it; surfaced in the playlist descriptor so the
+        # playlist view can refuse formats a client cannot decode (HEVC-in-TS).
+        self._video_codec = None
         # Seed the rolling window + frozen target from an existing descriptor so
         # a mid-session worker restart/takeover does not clobber the playlist to
         # a fresh window (MEDIA-SEQUENCE must never regress; RFC 8216 6.2.2). The
@@ -275,6 +279,7 @@ class HLSOutputManager:
                         if not self.running:
                             break
                         for segment in segmenter.feed(chunk):
+                            self._video_codec = segmenter.video_codec
                             self._store_segment(segment)
                             if not first_segment_stored:
                                 first_segment_stored = True
@@ -322,6 +327,7 @@ class HLSOutputManager:
                     "window": self._window,
                     "target": self.segment_duration,
                     "adv_target": self.adv_target,
+                    "vcodec": self._video_codec,
                 }
                 self._redis.setex(
                     RedisKeys.output_playlist(self.channel_id, self.fmt),

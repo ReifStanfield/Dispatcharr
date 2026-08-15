@@ -76,11 +76,18 @@ TARGET_ROUNDING_SLACK = 0.35
 DEMAND_CHECK_INTERVAL = 5
 DEMAND_GRACE_CHECKS = 2
 
-# Low-Latency HLS partial-segment target (seconds). 0 disables LL-HLS
-# (segments only). ~0.5s parts put the live edge within ~1.5s (PART-HOLD-BACK
-# = 3 x PART-TARGET) for players that support Blocking Playlist Reload, while
-# non-LL players ignore the part tags and use the whole segments unchanged.
-DEFAULT_PART_TARGET = 0.5
+# Low-Latency HLS partial-segment target (seconds); 0 disables LL-HLS
+# (segments only). Set HLS_PART_TARGET to ~0.5 to opt in, which puts the live
+# edge within ~1.5s (PART-HOLD-BACK = 3 x PART-TARGET) for players that support
+# Blocking Playlist Reload.
+#
+# OFF by default, because enabling it is not a transparent addition: an LL
+# playlist advertises EXT-X-VERSION:10, and a client that does not implement
+# version 10 is required to refuse the playlist outright rather than fall back
+# to the whole segments it also carries. The whole-segment path is the one
+# every client shares, so it stays the default and LL is opted into per
+# deployment once its players are known to handle it.
+DEFAULT_PART_TARGET = 0.0
 # A part must stay fetchable while it is advertised (up to ~3 segments back)
 # AND long enough for a blocking request already in flight to be answered. Sized
 # generously: it costs only Redis memory, while too short a TTL expires an

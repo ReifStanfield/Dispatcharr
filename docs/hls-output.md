@@ -56,6 +56,7 @@ The media playlist is a standard live RFC 8216 (version 3) playlist:
 - `#EXT-X-START:TIME-OFFSET=-<n>,PRECISE=YES` pinning the join point behind
   the live edge, so every player starts with the same runway
 - `#EXT-X-DISCONTINUITY` before a segment that follows a stream discontinuity
+- `#EXT-X-PROGRAM-DATE-TIME` on each segment, anchoring it to the wall clock
 - No `#EXT-X-ENDLIST` (the stream is live; players keep reloading)
 - A rolling window of segments (default 10 x ~4s)
 
@@ -82,11 +83,19 @@ channel satisfies this on the first read and never waits.
 
 ## Low-Latency HLS
 
-When `HLS_PART_TARGET` is greater than zero (default 0.5s) the media playlist
-is a Low-Latency HLS playlist (rfc8216bis). The in-progress segment is
-published as **partial segments** as it fills, so a client can ride the live
-edge within ~1.5s instead of the ~3 target durations a whole-segment live
-playlist forces.
+Low-Latency HLS is **off by default** and opted into by setting
+`HLS_PART_TARGET` greater than zero (0.5 seconds is the suggested value). When
+enabled, the media playlist becomes a Low-Latency HLS playlist (rfc8216bis)
+and the in-progress segment is published as **partial segments** as it fills,
+so a client can ride the live edge within ~1.5s instead of the ~3 target
+durations a whole-segment live playlist forces.
+
+It is opt-in rather than automatic because enabling it is not a transparent
+addition: the playlist advertises `EXT-X-VERSION:10`, and a client that does
+not implement version 10 is required by the spec to refuse the playlist
+outright — it will *not* fall back to the whole segments the same playlist
+still carries. Turn it on once you know the players on your deployment handle
+it, and turn it back off (`HLS_PART_TARGET=0`) if one regresses.
 
 The LL playlist additionally carries:
 
@@ -139,11 +148,10 @@ serves any catch-up fetch.
 
 ### Non-LL clients
 
-Set `HLS_PART_TARGET` to 0 to disable LL entirely and emit the version-3
-playlist described above. Note that with LL enabled the playlist advertises
-`EXT-X-VERSION:10`, which a client that does not implement version 10 is
-required by the spec to refuse — so this is the setting to reach for if an
-older player stops working.
+Leaving `HLS_PART_TARGET` at its default of 0 disables LL entirely and emits
+the version-3 playlist described above — the path every HLS client supports.
+This is also the setting to reach back for if a player regresses after LL is
+enabled.
 
 ## MIME types, caching, and CORS
 
@@ -190,5 +198,6 @@ HLS output carries the source codec untouched in MPEG-TS segments.
 - `HLS_SEGMENT_DURATION` (default 4 seconds) - target segment length.
 - `HLS_WINDOW_SIZE` (default 10) - number of segments retained in the rolling
   live playlist.
-- `HLS_PART_TARGET` (default 0.5 seconds) - Low-Latency partial-segment target.
-  Set to 0 to disable LL-HLS and serve the plain version-3 playlist.
+- `HLS_PART_TARGET` (default 0, LL-HLS disabled) - Low-Latency partial-segment
+  target. Set to ~0.5 seconds to enable LL-HLS; see the Low-Latency HLS section
+  for the client-compatibility caveat.

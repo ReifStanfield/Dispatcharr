@@ -235,7 +235,11 @@ def _install_stubs():
          get_alternate_streams=_noop)
     _mod("apps.proxy.utils", check_user_stream_limits=_noop)
     _mod("apps.proxy.stats_views", combined_stats=_noop)
-    _mod("dispatcharr.utils", network_access_allowed=lambda *a, **k: True)
+    # get_client_ip moved here in upstream's client-IP/proxy-trust work
+    # (c8b357c3); views.py imports both names from this module.
+    _mod("dispatcharr.utils",
+         network_access_allowed=lambda *a, **k: True,
+         get_client_ip=lambda request: "127.0.0.1")
 
     # live_proxy.utils: real get_logger is Django-logging based; stub it, but
     # the module also carries get_client_ip which the views import.
